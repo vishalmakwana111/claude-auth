@@ -233,7 +233,44 @@ Config lives in the index under `config.autoswitch`; the `Stop` hook is added an
 removed surgically (matched by the `claude-auth … autoswitch` substring) so the
 rest of `settings.json` is never touched.
 
-## 8. The `security` CLI surface used
+## 8. Token refresh, status line & pre-flight
+
+Three features build on the usage pipeline and hook mechanism.
+
+**Token refresh.** A saved account's access token is short-lived. `refresh_stored()`
+exchanges the stored refresh token for a fresh credential:
+
+```
+POST https://platform.claude.com/v1/oauth/token
+Content-Type: application/json
+{"grant_type":"refresh_token","refresh_token":"…","client_id":"9d1c250a-…"}
+```
+
+The response's `access_token` / `refresh_token` / `expires_in` are written back to the
+account's Keychain backup. Two guard rails:
+
+- **Inactive accounts only.** The active account's credential is owned by Claude
+  Code (it refreshes on its own schedule). Rotating it underneath a running
+  session would break that session's next refresh — so `claude-auth` never
+  refreshes the active account; it uses the live token as-is.
+- **Lazy + on-demand.** `usage` refreshes an account only when its token actually
+  returns `expired` (401), then retries once. `claude-auth refresh` lets you
+  proactively refresh all inactive backups.
+
+**Status line.** `claude-auth statusline` is network-free: it renders the active
+account plus its **cached** weekly % straight from the index, so it's instant on
+every render. When the cache is older than 5 minutes it spawns a *detached*
+`usage --quiet` to refresh in the background — the render never blocks. Output is
+ANSI-colored even though the stream is captured, because Claude Code renders ANSI
+from status-line output.
+
+**Pre-flight switch.** Auto-switch installs two hook points (§7 covers the idle
+`Stop` hook). The `SessionStart` hook runs the same check **synchronously** as a
+session begins — if the credential swap completes before Claude reads it, the new
+session lands directly on a fresh account, narrowing the "applies next restart"
+gap. It's throttled like the Stop check, so it usually costs one quick usage call.
+
+## 9. The `security` CLI surface used
 
 | Operation | Command |
 |-----------|---------|
@@ -244,7 +281,7 @@ rest of `settings.json` is never touched.
 
 The macOS account name on the live item is detected dynamically (falling back to `getpass.getuser()`), so nothing about the local user is hardcoded.
 
-## 9. Known trade-offs
+## 10. Known trade-offs
 
 - **macOS only.** Linux Claude Code stores credentials in `~/.claude/.credentials.json` (plaintext). A Linux backend would swap the `kc_*` functions for file operations; the rest of the architecture (index, identity swap, auto-sync) carries over unchanged.
 - **`-w "<secret>"` exposure.** The secret is passed as a process argument, so it's briefly visible to `ps` for the same user during a write. Local-only and transient; eliminating it would require a Keychain API binding rather than the `security` CLI.

@@ -136,6 +136,8 @@ claude-auth switch personal
 | `claude-auth switch [name]` | Switch to a saved account. Interactive picker if no name. `--force`, `--no-save`. |
 | `claude-auth usage [name]` | Show rate-limit usage (session + weekly) across accounts. Detail view for one account. |
 | `claude-auth autoswitch on/off/status` | Auto-switch to another account when usage gets high. `--threshold`, `--window`, `--strategy`. |
+| `claude-auth refresh [name]` | Refresh stored tokens of inactive accounts (keeps usage live & backups fresh). |
+| `claude-auth statusline` | Compact one-line status (active account + weekly %) for Claude Code's status line. |
 | `claude-auth current` / `whoami` | Show the active account. |
 | `claude-auth rename <old> <new>` | Rename a saved profile (moves its Keychain backup too). |
 | `claude-auth remove <name>` / `rm` | Delete a saved profile. `--force` to remove the active one. |
@@ -169,7 +171,29 @@ How it works:
 
 > **Important:** switching swaps the on-disk credential — it can't move an *already-running* session to the new account (the token is held in memory). So an auto-switch takes effect on your **next** Claude Code session/restart. The notification reminds you to restart.
 
-Check status any time with `claude-auth autoswitch status`, preview a decision with `claude-auth autoswitch run --force --dry-run`, and turn it off with `claude-auth autoswitch off` (which removes the hook).
+Auto-switch installs **two** hooks: a `Stop` hook (idle checkpoint, detached/zero-latency) and a `SessionStart` hook (synchronous **pre-flight** — it tries to switch *before* a new session loads its credentials, so the next session can land on a fresh account automatically).
+
+Check status any time with `claude-auth autoswitch status`, preview a decision with `claude-auth autoswitch run --force --dry-run`, and turn it off with `claude-auth autoswitch off` (which removes both hooks).
+
+### Keep every account's usage live: `refresh`
+
+A saved account's access token is short-lived (~hours), so an account you haven't touched in a while can show a stale snapshot. `claude-auth refresh` exchanges each inactive account's refresh token for a fresh one (Anthropic's `POST /v1/oauth/token`), so `usage` stays live and switching never lands on a dead token. It only touches **inactive** accounts — the active one is owned by Claude Code and left alone. `usage` also auto-refreshes an account's token on demand if it returns expired.
+
+### Status line
+
+`claude-auth statusline` prints a compact, network-free segment from cached usage — ideal for Claude Code's status line:
+
+```
+● work · wk 57% · ↺ Jun 25 3:29am
+```
+
+Wire it into `~/.claude/settings.json`:
+
+```jsonc
+"statusLine": { "type": "command", "command": "claude-auth statusline" }
+```
+
+…or append it to your existing status-line script. It reads the cached snapshot (instant), and opportunistically kicks off a background usage refresh when the cache is older than 5 minutes, so it stays current without ever blocking a render.
 
 ## How it works
 

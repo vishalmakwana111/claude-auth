@@ -24,11 +24,13 @@ import urllib.error
 import concurrent.futures
 from datetime import datetime, timezone
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 API_USAGE = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_BETA = "oauth-2025-04-20"
 ANTHROPIC_VERSION = "2023-06-01"
+OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
 HOME = os.path.expanduser("~")
 CLAUDE_JSON = os.path.join(HOME, ".claude.json")
@@ -156,6 +158,52 @@ def parse_usage(d):
         "week_opus": win("seven_day_opus"),
     }
 
+def refresh_access_token(refresh_token, timeout=10):
+    """Exchange a refresh token for a fresh credential. Returns (data, err)."""
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": OAUTH_CLIENT_ID,
+    }).encode()
+    req = urllib.request.Request(OAUTH_TOKEN_URL, data=body, method="POST", headers={
+        "Content-Type": "application/json",
+        "User-Agent": f"claude-auth/{__version__}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode()), None
+    except urllib.error.HTTPError as e:
+        return None, f"http {e.code}"
+    except Exception as e:
+        return None, str(e).split("]")[-1].strip()[:40] or "network error"
+
+def refresh_stored(name, idx=None):
+    """Refresh an inactive account's Keychain backup in place. (ok, err)."""
+    raw = kc_read(STORE_SERVICE, name)
+    if raw is None:
+        return False, "no stored credential"
+    blob = json.loads(raw)
+    cred = blob.get("claudeAiOauth", {})
+    rt = cred.get("refreshToken")
+    if not rt:
+        return False, "no refresh token"
+    data, err = refresh_access_token(rt)
+    if data is None:
+        return False, err
+    at = data.get("access_token")
+    if not at:
+        return False, "no access_token in response"
+    cred["accessToken"] = at
+    if data.get("refresh_token"):
+        cred["refreshToken"] = data["refresh_token"]
+    if data.get("expires_in"):
+        cred["expiresAt"] = int((time.time() + data["expires_in"]) * 1000)
+    blob["claudeAiOauth"] = cred
+    kc_write(STORE_SERVICE, name, json.dumps(blob), label=f"claude-auth: {name}")
+    if idx is not None and name in idx["accounts"]:
+        idx["accounts"][name]["expiresAt"] = cred.get("expiresAt")
+    return True, None
+
 def sev_color(pct):
     if pct is None:
         return dim
@@ -248,6 +296,8 @@ def render_help():
         ("switch",  "[name]",       "Switch to a saved account"),
         ("usage",   "[name]",       "Show rate-limit usage across accounts"),
         ("autoswitch", "[on|off]",  "Auto-switch accounts when usage gets high"),
+        ("refresh", "[name]",       "Refresh stored tokens of inactive accounts"),
+        ("statusline", "",          "Compact status line for Claude Code"),
         ("list",    "",             "List saved accounts" + dim("  (alias: ls)")),
         ("current", "",             "Show the active account" + dim("  (alias: whoami)")),
         ("rename",  "<old> <new>",  "Rename a saved profile"),
@@ -603,18 +653,31 @@ def _token_for(name, idx, active):
         return None
     return blob.get("claudeAiOauth", {}).get("accessToken")
 
-def _refresh_usage(name, idx, active):
-    """Fetch live usage for one account, caching the result. Returns dict."""
+def _get_usage(name, idx, active, allow_refresh=True):
+    """Live usage for an account, caching the result. Refreshes an expired
+    *inactive* token once and retries. Returns (normalized, err)."""
     token = _token_for(name, idx, active)
     if not token:
-        return {"name": name, "live": None, "error": "no token"}
+        return None, "no token"
     data, err = fetch_usage(token)
+    if err == "expired" and allow_refresh and name != active:
+        done, rerr = refresh_stored(name, idx)
+        if done:
+            token = _token_for(name, idx, active)
+            data, err = fetch_usage(token)
+        else:
+            return None, f"expired ({rerr})"
     if data is None:
-        return {"name": name, "live": None, "error": err}
+        return None, err
     norm = parse_usage(data)
     norm["fetchedAt"] = int(time.time())
     idx["accounts"][name]["usage"] = norm
-    return {"name": name, "live": norm, "error": None}
+    return norm, None
+
+def _refresh_usage(name, idx, active):
+    """cmd_usage helper: returns {name, live, error}."""
+    norm, err = _get_usage(name, idx, active)
+    return {"name": name, "live": norm, "error": err}
 
 def cmd_usage(args):
     idx = load_index()
@@ -629,17 +692,20 @@ def cmd_usage(args):
     if args.name and args.name not in accts:
         die(f"no such account: {bold(args.name)}")
 
-    if _TTY:
+    quiet = getattr(args, "quiet", False)
+    if _TTY and not quiet:
         sys.stdout.write(IND + clay("›") + " Fetching usage…")
         sys.stdout.flush()
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         results = {r["name"]: r for r in ex.map(
             lambda n: _refresh_usage(n, idx, active), names)}
     save_index(idx)
-    if _TTY:
+    if _TTY and not quiet:
         sys.stdout.write("\r\033[2K")  # return to start, clear the "Fetching" line
         sys.stdout.flush()
 
+    if quiet:
+        return
     if args.name:
         _usage_detail(args.name, idx, results[args.name], active)
     else:
@@ -748,6 +814,70 @@ def _usage_detail(name, idx, res, active):
     info(IND + dim("updated " + fresh))
     info()
 
+def cmd_refresh(args):
+    """Refresh the stored tokens of inactive accounts (keeps backups live)."""
+    idx = load_index()
+    active = active_name(idx)
+    if args.name and args.name not in idx["accounts"]:
+        die(f"no such account: {bold(args.name)}")
+    names = [args.name] if args.name else sorted(idx["accounts"])
+    if not names:
+        die("no saved accounts yet")
+    info()
+    for name in names:
+        if name == active:
+            info(IND + dim("○ " + name + "  (active — managed live by Claude Code, skipped)"))
+            continue
+        done, err = refresh_stored(name, idx)
+        if done:
+            ok(f"Refreshed {bold(name)}")
+        else:
+            warn(f"{name}: {err}")
+    save_index(idx)
+    info()
+
+def _maybe_bg_refresh(idx):
+    """Spawn a detached usage refresh if the cache is stale (keeps statusline live)."""
+    cfg = idx.setdefault("config", {})
+    if int(time.time()) - cfg.get("statuslineRefreshAt", 0) < 300:
+        return
+    cfg["statuslineRefreshAt"] = int(time.time())
+    try:
+        save_index(idx)
+        subprocess.Popen(f"nohup {_bin_path()} usage --quiet >/dev/null 2>&1 &",
+                         shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+def cmd_statusline(args):
+    """Compact one-line status for a Claude Code statusLine command. Network-free."""
+    global _TTY
+    if not _NO_COLOR and not args.plain:
+        _TTY = True   # statusLine output is captured but Claude Code renders ANSI
+    # statusLine commands receive session JSON on stdin; drain and ignore it
+    try:
+        if not sys.stdin.isatty():
+            sys.stdin.read()
+    except Exception:
+        pass
+    idx = load_index()
+    active = active_name(idx)
+    if not active:
+        oauth, _ = current_identity()
+        print(clay("◆") + " " + dim(oauth.get("emailAddress") or "not logged in"))
+        return
+    seg = green("●") + " " + bold(clay(active))
+    wk = (idx["accounts"][active].get("usage") or {}).get("week")
+    if wk and wk.get("pct") is not None:
+        pct = wk["pct"]
+        seg += dim(" · ") + sev_color(pct)(f"wk {round(pct)}%")
+        r = resets_at_str(wk.get("resets_at"))
+        if r:
+            seg += dim(" · ↺ " + r)
+    print(seg)
+    if not args.no_refresh:
+        _maybe_bg_refresh(idx)
+
 def cmd_switch(args):
     idx = load_index()
     accts = idx["accounts"]
@@ -844,16 +974,10 @@ def _as_config(idx):
     return cfg
 
 def _usage_pct(name, idx, active, window):
-    """Live usage % for `name` on `window`; caches the snapshot. (pct, err)."""
-    tok = _token_for(name, idx, active)
-    if not tok:
-        return None, "no token"
-    data, err = fetch_usage(tok)
-    if data is None:
+    """Live usage % for `name` on `window` (auto-refreshes if expired). (pct, err)."""
+    norm, err = _get_usage(name, idx, active)
+    if norm is None:
         return None, err
-    norm = parse_usage(data)
-    norm["fetchedAt"] = int(time.time())
-    idx["accounts"][name]["usage"] = norm
     w = norm.get(window)
     return (w["pct"] if w else None), None
 
@@ -880,8 +1004,14 @@ def _as_log(msg):
 def _bin_path():
     return shutil.which("claude-auth") or os.path.join(HOME, ".local/bin/claude-auth")
 
-def _hook_command():
-    return f"nohup {_bin_path()} autoswitch run --quiet >/dev/null 2>&1 &"
+def _hook_command(detached):
+    base = f"{_bin_path()} autoswitch run --quiet"
+    return f"nohup {base} >/dev/null 2>&1 &" if detached else base
+
+# Stop fires when Claude goes idle (detached, zero-latency). SessionStart fires
+# as a new session begins (synchronous, so the swap can land before the session
+# reads credentials — a best-effort pre-flight switch).
+_HOOK_EVENTS = (("Stop", True), ("SessionStart", False))
 
 def _read_settings():
     try:
@@ -903,43 +1033,58 @@ def _hook_is_ours(h):
     return isinstance(h, dict) and "claude-auth" in h.get("command", "") \
         and "autoswitch" in h.get("command", "")
 
-def _install_hook():
+def _install_hooks():
+    """Install/refresh our Stop + SessionStart hooks. Returns list of new events."""
     s = _read_settings()
-    stop = s.setdefault("hooks", {}).setdefault("Stop", [])
-    for group in stop:
-        for h in group.get("hooks", []):
-            if _hook_is_ours(h):
-                h["command"] = _hook_command()   # refresh in case path changed
-                _write_settings(s)
-                return False
-    stop.append({"hooks": [{"type": "command", "command": _hook_command()}]})
+    hooks = s.setdefault("hooks", {})
+    added = []
+    for event, detached in _HOOK_EVENTS:
+        lst = hooks.setdefault(event, [])
+        found = False
+        for group in lst:
+            for h in group.get("hooks", []):
+                if _hook_is_ours(h):
+                    h["command"] = _hook_command(detached)   # refresh path/flags
+                    found = True
+        if not found:
+            lst.append({"hooks": [{"type": "command",
+                                   "command": _hook_command(detached)}]})
+            added.append(event)
     _write_settings(s)
-    return True
+    return added
 
-def _uninstall_hook():
+def _uninstall_hooks():
     s = _read_settings()
-    stop = s.get("hooks", {}).get("Stop")
-    if not stop:
+    hooks = s.get("hooks", {})
+    if not hooks:
         return
-    new_stop = []
-    for group in stop:
-        kept = [h for h in group.get("hooks", []) if not _hook_is_ours(h)]
-        if kept:
-            group["hooks"] = kept
-            new_stop.append(group)
-    if new_stop:
-        s["hooks"]["Stop"] = new_stop
-    else:
-        s["hooks"].pop("Stop", None)
-        if not s["hooks"]:
-            s.pop("hooks", None)
+    for event, _ in _HOOK_EVENTS:
+        lst = hooks.get(event)
+        if not lst:
+            continue
+        new = []
+        for group in lst:
+            kept = [h for h in group.get("hooks", []) if not _hook_is_ours(h)]
+            if kept:
+                group["hooks"] = kept
+                new.append(group)
+        if new:
+            hooks[event] = new
+        else:
+            hooks.pop(event, None)
+    if not hooks:
+        s.pop("hooks", None)
     _write_settings(s)
 
 def _hook_installed():
-    for group in _read_settings().get("hooks", {}).get("Stop", []):
-        if any(_hook_is_ours(h) for h in group.get("hooks", [])):
-            return True
-    return False
+    hooks = _read_settings().get("hooks", {})
+    n = 0
+    for event, _ in _HOOK_EVENTS:
+        for group in hooks.get(event, []):
+            if any(_hook_is_ours(h) for h in group.get("hooks", [])):
+                n += 1
+                break
+    return n  # 0, 1, or 2 of our hook points present
 
 # ---- the check itself (invoked by the Stop hook) ----
 
@@ -1031,8 +1176,10 @@ def _autoswitch_status(idx, cfg):
          dim("  (next = round-robin · lowest = most headroom)"))
     info(IND * 2 + field("interval") + " " + ink(f"{cfg['intervalSec']}s") +
          dim("  min between checks"))
-    info(IND * 2 + field("hook") + " " +
-         (green("installed") if _hook_installed() else yellow("missing")))
+    n = _hook_installed()
+    hook_txt = green("Stop + SessionStart") if n == 2 else \
+        (yellow(f"{n}/2 present — re-run `autoswitch on`") if n else red("missing"))
+    info(IND * 2 + field("hooks") + " " + hook_txt)
     last = cfg.get("lastCheckAt") or 0
     info(IND * 2 + field("last check") + " " + dim(rel_time(last) if last else "never"))
     info()
@@ -1059,19 +1206,20 @@ def cmd_autoswitch(args):
         if args.interval is not None:
             cfg["intervalSec"] = args.interval
         save_index(idx)
-        installed = _install_hook()
+        added = _install_hooks()
         info()
         ok(f"Auto-switch enabled — switch above {bold(str(cfg['threshold']) + '%')} {cfg['window']} usage")
         hint(f"strategy {cfg['strategy']} · checks at most every {cfg['intervalSec']}s when Claude is idle")
-        hint("Stop hook " + ("installed" if installed else "refreshed") + " in ~/.claude/settings.json")
-        hint("a switch swaps the credential; it applies on your next Claude Code session/restart")
+        hint("hooks " + ("installed" if added else "refreshed") +
+             " in ~/.claude/settings.json " + dim("(Stop = at idle, SessionStart = pre-flight)"))
+        hint("SessionStart tries to switch before a new session loads; otherwise a switch applies on restart")
         info()
     elif args.action == "off":
         cfg["enabled"] = False
         save_index(idx)
-        _uninstall_hook()
+        _uninstall_hooks()
         info()
-        ok("Auto-switch disabled " + dim("(Stop hook removed)"))
+        ok("Auto-switch disabled " + dim("(hooks removed)"))
         info()
     else:  # status
         _autoswitch_status(idx, cfg)
@@ -1121,7 +1269,18 @@ def build_parser():
 
     u = sub.add_parser("usage", help="show rate-limit usage for your accounts")
     u.add_argument("name", nargs="?", help="account to detail (default: all)")
+    u.add_argument("--quiet", action="store_true", help="fetch & cache silently (no output)")
     u.set_defaults(func=cmd_usage)
+
+    rf = sub.add_parser("refresh", help="refresh stored tokens of inactive accounts")
+    rf.add_argument("name", nargs="?", help="account to refresh (default: all inactive)")
+    rf.set_defaults(func=cmd_refresh)
+
+    sl = sub.add_parser("statusline", help="compact status line for Claude Code")
+    sl.add_argument("--plain", action="store_true", help="no color")
+    sl.add_argument("--no-refresh", action="store_true",
+                    help="don't trigger a background usage refresh")
+    sl.set_defaults(func=cmd_statusline)
 
     asw = sub.add_parser("autoswitch", help="auto-switch when usage gets high")
     asw.add_argument("action", nargs="?", default="status",
