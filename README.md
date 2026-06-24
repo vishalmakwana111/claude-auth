@@ -5,14 +5,59 @@
 If you juggle more than one Claude Code login (personal, work, a client's org…), you know the pain: there's no built-in account switcher, so you end up logging out and back in every time. `claude-auth` fixes that. Save each account once, then flip between them instantly.
 
 ```console
+ ██████╗██╗      █████╗ ██╗   ██╗██████╗ ███████╗
+██╔════╝██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝
+██║     ██║     ███████║██║   ██║██║  ██║█████╗
+██║     ██║     ██╔══██║██║   ██║██║  ██║██╔══╝
+╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗
+ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝
+auth  ·  multi-account switcher for Claude Code
+```
+
+```console
 $ claude-auth list
-* personal   you@gmail.com           max
-  work       you@company.com  · Acme  team
+
+  Accounts   ·   2 saved
+
+  ┌───┬──────────┬───────────────────┬───────────┬──────┬─────────┐
+  │   │ ACCOUNT  │ EMAIL             │ ORG       │ PLAN │ SAVED   │
+  ├───┼──────────┼───────────────────┼───────────┼──────┼─────────┤
+  │ ● │ personal │ you@gmail.com     │ —         │ max  │ 2m ago  │
+  │ ○ │ work     │ you@company.com   │ Acme      │ team │ 3d ago  │
+  └───┴──────────┴───────────────────┴───────────┴──────┴─────────┘
+
+  ● active    ○ saved
 
 $ claude-auth switch work
-✓ switched to work  (you@company.com)
-  restart Claude Code (and any running sessions) to use this account.
+
+  ✓ Switched to work  · you@company.com
+  ↻ restart Claude Code (and running sessions) to use this account
 ```
+
+> The real output is rendered in Claude's warm "clay" palette with a gradient wordmark. Colors auto-disable when piped or when `NO_COLOR` is set.
+
+### Usage tracking
+
+`claude-auth usage` shows how much of each account's rate limit you've burned — the fastest way to decide *which account to switch to*:
+
+```console
+$ claude-auth usage
+
+  Usage   ·   weekly limit is the one that bites
+
+  ┌───┬──────────┬──────────────────────────┬─────────────────────────────────┬─────────┐
+  │   │ ACCOUNT  │ SESSION                  │ WEEK                            │ UPDATED │
+  ├───┼──────────┼──────────────────────────┼─────────────────────────────────┼─────────┤
+  │ ○ │ personal │ ██░░░░░░░░  23%  10:19pm │ ██░░░░░░░░  24%  Jun 26 12:29am │ live    │
+  │ ● │ work     │ █░░░░░░░░░  12%  8:39pm  │ ██████░░░░  57%  Jun 25 3:29am  │ live    │
+  └───┴──────────┴──────────────────────────┴─────────────────────────────────┴─────────┘
+
+  █ <50%   █ <80%   █ ≥80%
+```
+
+`claude-auth usage <name>` gives a detailed breakdown (5-hour session, weekly all-models, weekly Sonnet/Opus) with reset countdowns.
+
+It works across **all** accounts at once — without switching — because each account's token is already saved, and usage is fetched from Anthropic's `/api/oauth/usage` endpoint (the same data Claude Code's `/status` → Usage tab shows). Bars are colored by severity (green < 50%, amber < 80%, red ≥ 80%). If an inactive account's short-lived token has expired, the last fetched snapshot is shown with its age; switching to that account refreshes it.
 
 ---
 
@@ -89,6 +134,7 @@ claude-auth switch personal
 | `claude-auth add [name]` | Save the **currently** logged-in account. Name defaults to the email prefix. `--force` to overwrite. |
 | `claude-auth list` / `ls` | List saved accounts. `*` marks the active one. |
 | `claude-auth switch [name]` | Switch to a saved account. Interactive picker if no name. `--force`, `--no-save`. |
+| `claude-auth usage [name]` | Show rate-limit usage (session + weekly) across accounts. Detail view for one account. |
 | `claude-auth current` / `whoami` | Show the active account. |
 | `claude-auth rename <old> <new>` | Rename a saved profile (moves its Keychain backup too). |
 | `claude-auth remove <name>` / `rm` | Delete a saved profile. `--force` to remove the active one. |

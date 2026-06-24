@@ -8,24 +8,27 @@ profile, and restores any saved profile on demand.
 
 macOS only (uses the login Keychain via the `security` CLI). Secret tokens stay
 in the Keychain; only non-secret identity metadata is kept in a plaintext index.
-
-Commands:
-  claude-auth login [name]      Sign in fresh and save the result as a profile
-  claude-auth add [name]        Save the current account as a named profile
-  claude-auth list | ls         List saved accounts (* = active)
-  claude-auth switch [name]     Switch to a saved account (interactive if omitted)
-  claude-auth current | whoami  Show the active account
-  claude-auth rename <old> <new>
-  claude-auth remove | rm <name>
 """
 
 import sys
 import os
+import re
 import json
 import time
+import shutil
 import getpass
 import subprocess
 import argparse
+import urllib.request
+import urllib.error
+import concurrent.futures
+from datetime import datetime, timezone
+
+__version__ = "1.1.0"
+
+API_USAGE = "https://api.anthropic.com/api/oauth/usage"
+OAUTH_BETA = "oauth-2025-04-20"
+ANTHROPIC_VERSION = "2023-06-01"
 
 HOME = os.path.expanduser("~")
 CLAUDE_JSON = os.path.join(HOME, ".claude.json")
@@ -35,26 +38,230 @@ INDEX_PATH = os.path.join(STORE_DIR, "accounts.json")
 LIVE_SERVICE = "Claude Code-credentials"   # the item Claude Code itself reads
 STORE_SERVICE = "claude-auth-store"         # our namespaced backups, per account
 
-# ---- pretty output -------------------------------------------------------
+REPO = "github.com/vishalmakwana111/claude-auth"
 
-_TTY = sys.stdout.isatty()
-def _c(code, s):
+# ───────────────────────────── theme ──────────────────────────────────────
+
+_NO_COLOR = bool(os.environ.get("NO_COLOR"))
+_TTY = sys.stdout.isatty() and not _NO_COLOR
+
+# Claude's warm "clay" palette (truecolor 24-bit)
+CLAY      = (204, 120, 92)     # primary brand
+CLAY_LITE = (236, 170, 120)
+CLAY_DARK = (150, 78, 58)
+INK       = (236, 223, 196)    # warm off-white
+MUTE      = (140, 140, 140)
+OK        = (122, 192, 140)
+WARN      = (228, 182, 86)
+ERR       = (226, 110, 102)
+ACCENT    = (140, 174, 244)    # soft blue for numbers / links
+
+def _fg(rgb, s):
+    if not _TTY:
+        return s
+    r, g, b = rgb
+    return f"\033[38;2;{r};{g};{b}m{s}\033[0m"
+
+def _sgr(code, s):
     return f"\033[{code}m{s}\033[0m" if _TTY else s
-def bold(s):   return _c("1", s)
-def dim(s):    return _c("2", s)
-def green(s):  return _c("32", s)
-def cyan(s):   return _c("36", s)
-def red(s):    return _c("31", s)
-def yellow(s): return _c("33", s)
 
-def die(msg, code=1):
-    print(red("error: ") + msg, file=sys.stderr)
-    sys.exit(code)
+def bold(s):   return _sgr("1", s)
+def dim(s):    return _fg(MUTE, s)
+def clay(s):   return _fg(CLAY, s)
+def green(s):  return _fg(OK, s)
+def red(s):    return _fg(ERR, s)
+def yellow(s): return _fg(WARN, s)
+def cyan(s):   return _fg(ACCENT, s)
+def ink(s):    return _fg(INK, s)
 
-def info(msg):
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+def vlen(s):
+    """Visible width, ignoring ANSI escapes."""
+    return len(_ANSI_RE.sub("", s))
+
+def vpad(s, width, align="left"):
+    pad = max(0, width - vlen(s))
+    return (" " * pad + s) if align == "right" else (s + " " * pad)
+
+def _lerp(a, b, t):
+    return tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+def gradient(text, c1, c2):
+    """Horizontal color sweep c1 → c2 across the characters of `text`."""
+    if not _TTY:
+        return text
+    n = max(1, len(text) - 1)
+    return "".join(_fg(_lerp(c1, c2, i / n), ch) for i, ch in enumerate(text))
+
+def term_width():
+    try:
+        return shutil.get_terminal_size((80, 24)).columns
+    except Exception:
+        return 80
+
+def rel_time(ts):
+    """Human 'time ago' from a unix-seconds timestamp."""
+    if not ts:
+        return "—"
+    d = int(time.time()) - int(ts)
+    if d < 0:
+        d = 0
+    if d < 60:
+        return "just now"
+    for unit, secs in (("d", 86400), ("h", 3600), ("m", 60)):
+        if d >= secs:
+            return f"{d // secs}{unit} ago"
+    return "just now"
+
+# ─────────────────────────── usage / limits ───────────────────────────────
+
+def fetch_usage(access_token, timeout=8):
+    """GET /api/oauth/usage. Returns (data, None) or (None, error)."""
+    req = urllib.request.Request(API_USAGE, headers={
+        "Authorization": f"Bearer {access_token}",
+        "anthropic-beta": OAUTH_BETA,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "User-Agent": f"claude-auth/{__version__}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode()), None
+    except urllib.error.HTTPError as e:
+        return None, ("expired" if e.code == 401 else f"http {e.code}")
+    except Exception as e:
+        return None, str(e).split("]")[-1].strip()[:40] or "network error"
+
+def parse_usage(d):
+    """Normalize the API response to the windows we display."""
+    def win(key):
+        w = d.get(key) or {}
+        u = w.get("utilization")
+        if u is None:
+            return None
+        return {"pct": float(u), "resets_at": w.get("resets_at")}
+    return {
+        "session": win("five_hour"),
+        "week": win("seven_day"),
+        "week_sonnet": win("seven_day_sonnet"),
+        "week_opus": win("seven_day_opus"),
+    }
+
+def sev_color(pct):
+    if pct is None:
+        return dim
+    return green if pct < 50 else (yellow if pct < 80 else red)
+
+def bar(pct, width=12):
+    """Colored utilization bar; visible width is always `width`."""
+    if pct is None:
+        return dim("░" * width)
+    p = max(0.0, min(100.0, pct))
+    filled = round(width * p / 100)
+    return sev_color(p)("█" * filled) + dim("░" * (width - filled))
+
+def pct_str(pct):
+    return "  —" if pct is None else f"{round(pct):>3d}%"
+
+def _parse_iso(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+def resets_at_str(iso):
+    """Local clock time the window resets, e.g. '9:59pm' or 'Jun 25 3:29am'."""
+    dt = _parse_iso(iso)
+    if not dt:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    local = dt.astimezone()
+    now = datetime.now().astimezone()
+    clock = f"{local.strftime('%-I:%M')}{local.strftime('%p').lower()}"
+    if local.date() == now.date():
+        return clock
+    return f"{local.strftime('%b %-d')} {clock}"
+
+# ─────────────────────────── messages ─────────────────────────────────────
+
+IND = "  "
+
+def info(msg=""):
     print(msg)
 
-# ---- keychain ------------------------------------------------------------
+def ok(msg):
+    info(IND + green("✓") + " " + msg)
+
+def warn(msg):
+    info(IND + yellow("!") + " " + msg)
+
+def step(msg):
+    info(IND + clay("›") + " " + msg)
+
+def hint(msg):
+    info(IND + dim(msg))
+
+def die(msg, code=1):
+    print(IND + red("✗") + " " + msg, file=sys.stderr)
+    sys.exit(code)
+
+# ──────────────────────────── banner / help ───────────────────────────────
+
+_WORDMARK = [
+    " ██████╗██╗      █████╗ ██╗   ██╗██████╗ ███████╗",
+    "██╔════╝██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝",
+    "██║     ██║     ███████║██║   ██║██║  ██║█████╗  ",
+    "██║     ██║     ██╔══██║██║   ██║██║  ██║██╔══╝  ",
+    "╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗",
+    " ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝",
+]
+
+def render_banner():
+    out = []
+    if term_width() >= 54:
+        width = max(len(l) for l in _WORDMARK)
+        for line in _WORDMARK:
+            out.append(IND + gradient(line.ljust(width), CLAY_LITE, CLAY_DARK))
+        out.append(IND + bold(clay("auth")) +
+                   dim("  ·  multi-account switcher for Claude Code"))
+    else:
+        out.append(IND + clay("◆ ") + bold(ink("claude-auth")))
+        out.append(IND + dim("multi-account switcher for Claude Code"))
+    return "\n".join(out)
+
+def render_help():
+    rows = [
+        ("login",   "[name]",       "Sign in fresh, then save as a profile"),
+        ("add",     "[name]",       "Save the currently logged-in account"),
+        ("switch",  "[name]",       "Switch to a saved account"),
+        ("usage",   "[name]",       "Show rate-limit usage across accounts"),
+        ("list",    "",             "List saved accounts" + dim("  (alias: ls)")),
+        ("current", "",             "Show the active account" + dim("  (alias: whoami)")),
+        ("rename",  "<old> <new>",  "Rename a saved profile"),
+        ("remove",  "<name>",       "Delete a saved profile" + dim("  (alias: rm)")),
+    ]
+    cw = max(len(c) for c, _, _ in rows)
+    aw = max(len(a) for _, a, _ in rows)
+    L = ["", render_banner(), ""]
+    L.append(IND + bold(clay("USAGE")))
+    L.append(IND * 2 + ink("claude-auth") + " " + dim("<command> [options]"))
+    L.append("")
+    L.append(IND + bold(clay("COMMANDS")))
+    for c, a, d in rows:
+        L.append(IND * 2 + bold(ink(vpad(c, cw))) + "  " +
+                 dim(vpad(a, aw)) + "  " + d)
+    L.append("")
+    L.append(IND + bold(clay("EXAMPLES")))
+    for ex in ("claude-auth login work", "claude-auth switch personal", "claude-auth list"):
+        L.append(IND * 2 + dim("$ ") + clay(ex))
+    L.append("")
+    L.append(IND + dim("docs   ") + cyan(REPO) + dim(f"   ·   v{__version__}"))
+    L.append("")
+    return "\n".join(L)
+
+# ───────────────────────────── keychain ───────────────────────────────────
 
 def _kc_account_for_live():
     """The macOS account name the live credential item is stored under."""
@@ -99,7 +306,7 @@ def kc_delete(service, account):
         capture_output=True, text=True,
     )
 
-# ---- live credential + identity -----------------------------------------
+# ─────────────────────── live credential + identity ───────────────────────
 
 def read_live_credential():
     acct = _kc_account_for_live()
@@ -124,7 +331,7 @@ def read_claude_json():
         die(f"{CLAUDE_JSON} is not valid JSON")
 
 def write_claude_json(data):
-    # atomic-ish write to avoid corrupting the (large) config on crash
+    # atomic write to avoid corrupting the (large) config on crash
     tmp = CLAUDE_JSON + ".claude-auth.tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
@@ -135,7 +342,7 @@ def current_identity():
     cj = read_claude_json()
     return cj.get("oauthAccount") or {}, cj.get("userID")
 
-# ---- index ---------------------------------------------------------------
+# ───────────────────────────── index ──────────────────────────────────────
 
 def load_index():
     try:
@@ -172,7 +379,7 @@ def active_name(idx):
             return name
     return None
 
-# ---- snapshot / restore --------------------------------------------------
+# ─────────────────────────── snapshot / restore ───────────────────────────
 
 def snapshot_into(name, idx, *, quiet=False):
     """Capture the live account into profile `name`."""
@@ -196,7 +403,8 @@ def snapshot_into(name, idx, *, quiet=False):
     }
     save_index(idx)
     if not quiet:
-        info(f"saved {bold(name)}  {dim('(' + (oauth.get('emailAddress') or '?') + ')')}")
+        email = oauth.get("emailAddress") or "?"
+        ok(f"Saved {bold(clay(name))}  {dim('· ' + email)}")
 
 def restore(name, idx):
     """Make profile `name` the active account."""
@@ -219,7 +427,7 @@ def restore(name, idx):
         cj["userID"] = prof["userID"]
     write_claude_json(cj)
 
-# ---- commands ------------------------------------------------------------
+# ───────────────────────────── commands ───────────────────────────────────
 
 def cmd_login(args):
     """Drive `claude auth login`, then save whatever account we land on."""
@@ -240,7 +448,9 @@ def cmd_login(args):
     if args.email:
         cmd += ["--email", args.email]
 
-    info(dim("launching `claude auth login` — complete sign-in in your browser…\n"))
+    info()
+    step("Launching " + clay("claude auth login") + " — finish sign-in in your browser…")
+    info()
     try:
         r = subprocess.run(cmd)
     except FileNotFoundError:
@@ -260,12 +470,13 @@ def cmd_login(args):
 
     for n, p in idx["accounts"].items():
         if p.get("accountUuid") == new_uuid and n != name:
-            info(yellow(f"note: this account is already saved as '{n}'"))
+            warn(f"this account is already saved as {bold(n)}")
 
-    print()
+    info()
     snapshot_into(name, idx)
     if prev_uuid and prev_uuid == new_uuid:
-        info(dim("(same account as before — refreshed its stored tokens)"))
+        hint("(same account as before — refreshed its stored tokens)")
+    info()
 
 def cmd_add(args):
     idx = load_index()
@@ -275,53 +486,262 @@ def cmd_add(args):
     if not name:
         die("could not infer a name; pass one: claude-auth add <name>")
     if name in idx["accounts"] and not args.force:
-        die(f"'{name}' already exists; use a different name or --force to overwrite")
+        die(f"'{name}' already exists — pass {bold('--force')} to overwrite")
+    info()
     snapshot_into(name, idx)
+    info()
+
+def _cell(text, w, colorfn, align="left"):
+    return " " + colorfn(vpad(text, w, align)) + " "
 
 def cmd_list(args):
     idx = load_index()
     accts = idx["accounts"]
+    info()
     if not accts:
-        info(dim("no saved accounts. Run `claude-auth add` while logged in."))
+        hint("No saved accounts yet.")
+        info(IND + dim("Get started:  ") + clay("claude-auth login <name>") +
+             dim("  or  ") + clay("claude-auth add"))
+        info()
         return
+
     active = active_name(idx)
-    now = time.time()
-    name_w = max(len(n) for n in accts) + 1
+    rows = []
     for name, p in sorted(accts.items()):
-        mark = green("*") if name == active else " "
-        email = p.get("email") or dim("?")
-        org = p.get("organizationName") or ""
-        exp = p.get("expiresAt")
-        if exp and exp / 1000 < now:
-            status = red("expired")
-        else:
-            status = dim(p.get("subscriptionType") or "")
-        line = f"{mark} {bold(name.ljust(name_w))} {email}"
-        if org:
-            line += dim(f"  · {org}")
-        if status:
-            line += f"  {status}"
-        info(line)
+        rows.append({
+            "active": name == active,
+            "name": name,
+            "email": p.get("email") or "—",
+            "org": p.get("organizationName") or "—",
+            "plan": p.get("subscriptionType") or "—",
+            "saved": rel_time(p.get("updatedAt")),
+        })
+
+    w_name = max(len("ACCOUNT"), max(len(r["name"]) for r in rows))
+    w_mail = max(len("EMAIL"),   max(len(r["email"]) for r in rows))
+    w_org  = max(len("ORG"),     max(len(r["org"]) for r in rows))
+    w_plan = max(len("PLAN"),    max(len(r["plan"]) for r in rows))
+    w_save = max(len("SAVED"),   max(len(r["saved"]) for r in rows))
+    widths = [1, w_name, w_mail, w_org, w_plan, w_save]
+
+    def border(l, m, rt):
+        return dim(l + m.join("─" * (w + 2) for w in widths) + rt)
+
+    def line(cells):
+        return IND + dim("│") + dim("│").join(cells) + dim("│")
+
+    H = lambda s: bold(dim(s))
+    n = len(rows)
+    info(IND + bold(clay("Accounts")) + dim(f"   ·   {n} saved"))
+    info()
+    info(IND + border("┌", "┬", "┐"))
+    info(line([_cell("", 1, dim),
+               _cell("ACCOUNT", w_name, H), _cell("EMAIL", w_mail, H),
+               _cell("ORG", w_org, H), _cell("PLAN", w_plan, H),
+               _cell("SAVED", w_save, H)]))
+    info(IND + border("├", "┼", "┤"))
+    for r in rows:
+        a = r["active"]
+        dot = green("●") if a else dim("○")
+        name_c = (lambda s: bold(clay(s))) if a else ink
+        text_c = ink if a else dim
+        plan_c = green if a else dim
+        info(line([" " + dot + " ",
+                   _cell(r["name"], w_name, name_c),
+                   _cell(r["email"], w_mail, text_c),
+                   _cell(r["org"], w_org, text_c),
+                   _cell(r["plan"], w_plan, plan_c),
+                   _cell(r["saved"], w_save, dim)]))
+    info(IND + border("└", "┴", "┘"))
+    info()
+    info(IND + green("●") + dim(" active") + "    " + dim("○ saved"))
     if not active:
-        info(dim("\n(active account doesn't match any saved profile — `claude-auth add` to save it)"))
+        info()
+        warn("active account isn't saved yet — run " + clay("claude-auth add"))
+    info()
 
 def cmd_current(args):
     idx = load_index()
     active = active_name(idx)
     oauth, _ = current_identity()
     email = oauth.get("emailAddress")
+    org = oauth.get("organizationName")
+    info()
     if active:
-        info(f"{bold(active)}  {dim('(' + (email or '?') + ')')}")
+        p = idx["accounts"].get(active, {})
+        info(IND + green("●") + " " + bold(clay(active)))
+        info(IND * 2 + ink(email or "?"))
+        meta = "  ·  ".join(x for x in [org, p.get("subscriptionType")] if x)
+        if meta:
+            info(IND * 2 + dim(meta))
     elif email:
-        info(f"{email} {dim('(not saved — run `claude-auth add`)')}")
+        info(IND + yellow("●") + " " + ink(email) + dim("   (not saved)"))
+        info(IND * 2 + dim("run ") + clay("claude-auth add") + dim(" to save it"))
     else:
-        info(dim("not logged in"))
+        hint("not logged in")
+    info()
+
+def _token_for(name, idx, active):
+    """Access token for an account: live blob if active, else its backup."""
+    if name == active:
+        blob, _ = read_live_credential()
+    else:
+        raw = kc_read(STORE_SERVICE, name)
+        blob = json.loads(raw) if raw else None
+    if not blob:
+        return None
+    return blob.get("claudeAiOauth", {}).get("accessToken")
+
+def _refresh_usage(name, idx, active):
+    """Fetch live usage for one account, caching the result. Returns dict."""
+    token = _token_for(name, idx, active)
+    if not token:
+        return {"name": name, "live": None, "error": "no token"}
+    data, err = fetch_usage(token)
+    if data is None:
+        return {"name": name, "live": None, "error": err}
+    norm = parse_usage(data)
+    norm["fetchedAt"] = int(time.time())
+    idx["accounts"][name]["usage"] = norm
+    return {"name": name, "live": norm, "error": None}
+
+def cmd_usage(args):
+    idx = load_index()
+    accts = idx["accounts"]
+    if not accts:
+        info()
+        hint("No saved accounts yet — run " + clay("claude-auth login <name>"))
+        info()
+        return
+    active = active_name(idx)
+    names = [args.name] if args.name else sorted(accts)
+    if args.name and args.name not in accts:
+        die(f"no such account: {bold(args.name)}")
+
+    if _TTY:
+        sys.stdout.write(IND + clay("›") + " Fetching usage…")
+        sys.stdout.flush()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        results = {r["name"]: r for r in ex.map(
+            lambda n: _refresh_usage(n, idx, active), names)}
+    save_index(idx)
+    if _TTY:
+        sys.stdout.write("\r\033[2K")  # return to start, clear the "Fetching" line
+        sys.stdout.flush()
+
+    if args.name:
+        _usage_detail(args.name, idx, results[args.name], active)
+    else:
+        _usage_table(names, idx, results, active)
+
+def _usage_source(name, idx, res):
+    """Return (usage_dict, freshness_label) using live result or cache."""
+    if res["live"]:
+        return res["live"], "live"
+    cached = idx["accounts"][name].get("usage")
+    if cached:
+        return cached, rel_time(cached.get("fetchedAt"))
+    return None, res["error"] or "unavailable"
+
+def _win_cell(win, barw=10):
+    """Bar + percent + reset-time for one usage window."""
+    if not win:
+        return bar(None, barw) + "   —"
+    pct = win["pct"]
+    cell = bar(pct, barw) + " " + sev_color(pct)(pct_str(pct))
+    rt = resets_at_str(win.get("resets_at"))
+    if rt:
+        cell += dim("  " + rt)
+    return cell
+
+def _usage_table(names, idx, results, active):
+    BARW = 10
+    rows = []
+    for name in names:
+        u, fresh = _usage_source(name, idx, results[name])
+        rows.append({
+            "name": name, "active": name == active, "fresh": fresh,
+            "has": bool(u),
+            "sess": _win_cell(u.get("session") if u else None, BARW),
+            "week": _win_cell(u.get("week") if u else None, BARW),
+        })
+    w_name = max(len("ACCOUNT"), max(len(r["name"]) for r in rows))
+    w_sess = max(len("SESSION"), max(vlen(r["sess"]) for r in rows))
+    w_week = max(len("WEEK"),    max(vlen(r["week"]) for r in rows))
+    w_fresh = max(len("UPDATED"), max(len(r["fresh"]) for r in rows))
+    widths = [1, w_name, w_sess, w_week, w_fresh]
+
+    def border(l, m, rt):
+        return dim(l + m.join("─" * (w + 2) for w in widths) + rt)
+
+    def line(cells):
+        return IND + dim("│") + dim("│").join(cells) + dim("│")
+
+    H = lambda s: bold(dim(s))
+    info()
+    info(IND + bold(clay("Usage")) + dim("   ·   weekly limit is the one that bites"))
+    info()
+    info(IND + border("┌", "┬", "┐"))
+    info(line([_cell("", 1, dim),
+               _cell("ACCOUNT", w_name, H),
+               _cell("SESSION", w_sess, H),
+               _cell("WEEK", w_week, H),
+               _cell("UPDATED", w_fresh, H)]))
+    info(IND + border("├", "┼", "┤"))
+    for r in rows:
+        a = r["active"]
+        dot = green("●") if a else dim("○")
+        name_c = (lambda s: bold(clay(s))) if a else ink
+        fresh_c = green if r["fresh"] == "live" else (dim if r["has"] else yellow)
+        info(line([" " + dot + " ",
+                   _cell(r["name"], w_name, name_c),
+                   " " + vpad(r["sess"], w_sess) + " ",
+                   " " + vpad(r["week"], w_week) + " ",
+                   _cell(r["fresh"], w_fresh, fresh_c)]))
+    info(IND + border("└", "┴", "┘"))
+    info()
+    info(IND + sev_color(10)("█") + dim(" <50%   ") + sev_color(60)("█") +
+         dim(" <80%   ") + sev_color(90)("█") + dim(" ≥80%"))
+    info()
+
+def _usage_detail(name, idx, res, active):
+    u, fresh = _usage_source(name, idx, res)
+    p = idx["accounts"][name]
+    dot = green("●") if name == active else dim("○")
+    info()
+    info(IND + dot + " " + bold(clay(name)) + dim("  · " + (p.get("email") or "")))
+    info()
+    if not u:
+        warn(f"usage unavailable ({res['error']})")
+        if name != active:
+            hint("the stored token may be expired — " + clay(f"claude-auth switch {name}") +
+                 dim(" refreshes it"))
+        info()
+        return
+    label_w = 17
+    BARW = 20
+    def row(label, win):
+        if not win:
+            info(IND + dim(vpad(label, label_w)) + " " + dim("░" * BARW) + "   —")
+            return
+        pct = win["pct"]
+        info(IND + ink(vpad(label, label_w)) + " " + bar(pct, BARW) + " " +
+             sev_color(pct)(pct_str(pct)) +
+             dim(f"   resets {resets_at_str(win['resets_at'])}"))
+    row("Session (5h)", u.get("session"))
+    row("Week (all models)", u.get("week"))
+    row("Week (Sonnet)", u.get("week_sonnet"))
+    if u.get("week_opus"):
+        row("Week (Opus)", u.get("week_opus"))
+    info()
+    info(IND + dim("updated " + fresh))
+    info()
 
 def cmd_switch(args):
     idx = load_index()
     accts = idx["accounts"]
     if not accts:
-        die("no saved accounts yet. Run `claude-auth add` while logged in.")
+        die("no saved accounts yet — run " + clay("claude-auth login <name>"))
 
     name = args.name
     if not name:
@@ -330,11 +750,13 @@ def cmd_switch(args):
             return
 
     if name not in accts:
-        die(f"no such account: {name}")
+        die(f"no such account: {bold(name)}")
 
     active = active_name(idx)
     if active == name and not args.force:
-        info(dim(f"already on {bold(name)}"))
+        info()
+        step(f"Already on {bold(clay(name))}")
+        info()
         return
 
     # keep the outgoing account's stored copy fresh (tokens rotate, MCP auth, etc.)
@@ -343,20 +765,27 @@ def cmd_switch(args):
 
     restore(name, idx)
     p = accts[name]
-    info(f"{green('✓')} switched to {bold(name)}  {dim('(' + (p.get('email') or '?') + ')')}")
-    info(dim("  restart Claude Code (and any running sessions) to use this account."))
+    info()
+    ok(f"Switched to {bold(clay(name))}  {dim('· ' + (p.get('email') or ''))}")
+    hint("↻ restart Claude Code (and running sessions) to use this account")
+    info()
 
 def _interactive_pick(idx):
     accts = sorted(idx["accounts"].items())
     active = active_name(idx)
-    info(bold("Select an account:"))
+    w = max(len(n) for n, _ in accts)
+    info()
+    info(IND + bold(clay("Select an account")))
+    info()
     for i, (name, p) in enumerate(accts, 1):
-        mark = green("*") if name == active else " "
-        info(f"  {mark} {cyan(str(i))}. {bold(name)}  {dim('(' + (p.get('email') or '?') + ')')}")
+        dot = green("●") if name == active else dim("○")
+        info(IND * 2 + cyan(f"{i}") + "  " + dot + " " +
+             bold(ink(vpad(name, w))) + "   " + dim(p.get("email") or ""))
+    info()
     try:
-        choice = input("> ").strip()
+        choice = input(IND + clay("›") + " ").strip()
     except (EOFError, KeyboardInterrupt):
-        info("")
+        info()
         return None
     if not choice:
         return None
@@ -369,7 +798,7 @@ def _interactive_pick(idx):
 def cmd_rename(args):
     idx = load_index()
     if args.old not in idx["accounts"]:
-        die(f"no such account: {args.old}")
+        die(f"no such account: {bold(args.old)}")
     if args.new in idx["accounts"]:
         die(f"'{args.new}' already exists")
     raw = kc_read(STORE_SERVICE, args.old)
@@ -378,26 +807,36 @@ def cmd_rename(args):
         kc_delete(STORE_SERVICE, args.old)
     idx["accounts"][args.new] = idx["accounts"].pop(args.old)
     save_index(idx)
-    info(f"renamed {bold(args.old)} → {bold(args.new)}")
+    info()
+    ok(f"Renamed {bold(args.old)} {dim('→')} {bold(clay(args.new))}")
+    info()
 
 def cmd_remove(args):
     idx = load_index()
     if args.name not in idx["accounts"]:
-        die(f"no such account: {args.name}")
+        die(f"no such account: {bold(args.name)}")
     if active_name(idx) == args.name and not args.force:
-        die(f"'{args.name}' is the active account; use --force to remove it anyway")
+        die(f"'{args.name}' is the active account — pass {bold('--force')} to remove it")
     kc_delete(STORE_SERVICE, args.name)
     del idx["accounts"][args.name]
     save_index(idx)
-    info(f"removed {bold(args.name)}")
+    info()
+    ok(f"Removed {bold(args.name)}")
+    info()
 
-# ---- arg parsing ---------------------------------------------------------
+# ──────────────────────────── arg parsing ─────────────────────────────────
+
+class BrandParser(argparse.ArgumentParser):
+    def format_help(self):
+        return render_help() + "\n"
+    def error(self, message):
+        die(message + dim("   ·   see ") + clay("claude-auth --help"), code=2)
 
 def build_parser():
-    p = argparse.ArgumentParser(
-        prog="claude-auth",
-        description="Switch between multiple Claude Code accounts (macOS).",
-    )
+    p = BrandParser(prog="claude-auth", add_help=True,
+                    description="Switch between multiple Claude Code accounts (macOS).")
+    p.add_argument("-V", "--version", action="version",
+                   version=f"claude-auth {__version__}")
     sub = p.add_subparsers(dest="cmd")
 
     lg = sub.add_parser("login", help="sign in fresh and save the result as a profile")
@@ -428,6 +867,10 @@ def build_parser():
         c = sub.add_parser(alias, help="show the active account")
         c.set_defaults(func=cmd_current)
 
+    u = sub.add_parser("usage", help="show rate-limit usage for your accounts")
+    u.add_argument("name", nargs="?", help="account to detail (default: all)")
+    u.set_defaults(func=cmd_usage)
+
     rn = sub.add_parser("rename", help="rename a saved account")
     rn.add_argument("old")
     rn.add_argument("new")
@@ -448,7 +891,7 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
     if not getattr(args, "func", None):
-        parser.print_help()
+        print(render_help())
         sys.exit(0)
     args.func(args)
 

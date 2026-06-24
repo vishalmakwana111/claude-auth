@@ -146,7 +146,47 @@ rename: copy Keychain backup old→new, delete old, move index entry
 remove: delete Keychain backup, drop index entry
 ```
 
-## 6. The `security` CLI surface used
+## 6. Usage tracking
+
+`claude-auth usage` reports each account's rate-limit consumption. The data comes
+from Anthropic's OAuth usage endpoint — the same source Claude Code's
+`/status → Usage` tab uses:
+
+```
+GET https://api.anthropic.com/api/oauth/usage
+    Authorization: Bearer <accessToken>
+    anthropic-beta: oauth-2025-04-20
+    anthropic-version: 2023-06-01
+```
+
+Response (relevant fields):
+
+```jsonc
+{
+  "five_hour":        { "utilization": 12.0, "resets_at": "2026-…T15:09:59Z" },  // session
+  "seven_day":        { "utilization": 57.0, "resets_at": "2026-…T21:59:59Z" },  // weekly, all models
+  "seven_day_sonnet": { "utilization": 13.0, "resets_at": "…" },
+  "seven_day_opus":   null
+}
+```
+
+Two design points make this work cleanly:
+
+- **No switching required.** Each saved account's access token lives in its
+  Keychain backup, so usage for *every* account is fetched in parallel (a thread
+  pool) using its own token — the active account uses the live token, the rest
+  use their backups. You see all accounts at once.
+- **Read-only, no token rotation.** The endpoint is a `GET`; it mutates nothing.
+  This version deliberately does **not** refresh tokens — refreshing rotates the
+  refresh token and could disrupt the active Claude Code session. Inactive
+  accounts whose short-lived (~hours) token has expired fall back to the last
+  cached snapshot (stored in the index under `usage.fetchedAt`), labeled with its
+  age; switching to such an account refreshes its token via the normal flow.
+
+Bars are colored by severity (`< 50%` green, `< 80%` amber, `≥ 80%` red). The
+weekly window is highlighted because it's the limit that usually binds.
+
+## 7. The `security` CLI surface used
 
 | Operation | Command |
 |-----------|---------|
@@ -157,7 +197,7 @@ remove: delete Keychain backup, drop index entry
 
 The macOS account name on the live item is detected dynamically (falling back to `getpass.getuser()`), so nothing about the local user is hardcoded.
 
-## 7. Known trade-offs
+## 8. Known trade-offs
 
 - **macOS only.** Linux Claude Code stores credentials in `~/.claude/.credentials.json` (plaintext). A Linux backend would swap the `kc_*` functions for file operations; the rest of the architecture (index, identity swap, auto-sync) carries over unchanged.
 - **`-w "<secret>"` exposure.** The secret is passed as a process argument, so it's briefly visible to `ps` for the same user during a write. Local-only and transient; eliminating it would require a Keychain API binding rather than the `security` CLI.
