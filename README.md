@@ -141,6 +141,9 @@ claude-auth switch personal
 | `claude-auth current` / `whoami` | Show the active account. |
 | `claude-auth rename <old> <new>` | Rename a saved profile (moves its Keychain backup too). |
 | `claude-auth remove <name>` / `rm` | Delete a saved profile. `--force` to remove the active one. |
+| `claude-auth doctor` | Health-check the setup: `claude`/PATH/Keychain/hooks/token validity. |
+| `claude-auth completion bash\|zsh` | Output a shell-completion script (tab-complete commands & account names). |
+| `claude-auth commands` | Show a grouped cheat sheet of every command, with flags and aliases. |
 
 ### Flag reference
 
@@ -195,6 +198,49 @@ Wire it into `~/.claude/settings.json`:
 
 …or append it to your existing status-line script. It reads the cached snapshot (instant), and opportunistically kicks off a background usage refresh when the cache is older than 5 minutes, so it stays current without ever blocking a render.
 
+### Shell completion
+
+Tab-complete commands *and* account names:
+
+```bash
+# zsh — add to ~/.zshrc:
+eval "$(claude-auth completion zsh)"
+# bash — add to ~/.bashrc:
+eval "$(claude-auth completion bash)"
+```
+
+```console
+$ claude-auth switch <TAB>
+personal   work
+$ claude-auth usage wo<TAB>      # → work
+```
+
+### Health check
+
+`claude-auth doctor` verifies the whole setup in one shot:
+
+```console
+$ claude-auth doctor
+
+  Doctor   ·   checking your setup
+
+  ✓ macOS
+  ✓ claude CLI   2.1.187 (Claude Code)
+  ✓ claude-auth on PATH   /Users/you/.local/bin/claude-auth
+  ✓ Keychain access   live credential present
+  ✓ 2 account(s) saved
+  ✓ active account   personal
+  ✓ autoswitch   Stop + SessionStart hooks present
+
+  accounts:
+  ✓ personal   active (managed live by Claude Code)
+  ✓ work       token valid
+
+  ● 9 ok
+```
+
+It catches the common gotchas — `claude` not on PATH, missing/partial auto-switch hooks, stale tokens, an active login that isn't saved.
+
 ## How it works
 
 ```
@@ -247,6 +293,16 @@ A full deep-dive — storage layout, the in-place-update trick, atomic writes, a
 
 - **macOS only** for now. Linux stores credentials in `~/.claude/.credentials.json` (plaintext) instead of the Keychain; a Linux backend is a natural future addition.
 - Switching affects **new** sessions only.
+
+## 🐈 One more thing
+
+Run `claude-auth` (or `claude-auth --help`) in a real terminal and a little cat walks the full width of your CLI — in the clay gradient — and stops at the right edge with a trailing `meow~ ♪`, just above the wordmark. It's purely cosmetic: it's skipped when output is piped, and you can turn it off with `CLAUDE_AUTH_NO_ANIM=1`.
+
+```
+                                              meow~ ♪ /\_/\
+                                                      ( ^.^ )
+                                                       > ^ <
+```
 
 ## License
 

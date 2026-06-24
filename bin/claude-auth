@@ -24,7 +24,7 @@ import urllib.error
 import concurrent.futures
 from datetime import datetime, timezone
 
-__version__ = "1.3.0"
+__version__ = "1.6.0"
 
 API_USAGE = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_BETA = "oauth-2025-04-20"
@@ -289,6 +289,57 @@ def render_banner():
         out.append(IND + dim("multi-account switcher for Claude Code"))
     return "\n".join(out)
 
+def _play_cat():
+    """A cat walks continuously across the full width of the CLI, then stops.
+    No-op unless we're attached to a real terminal."""
+    if not sys.stdout.isatty() or os.environ.get("CLAUDE_AUTH_NO_ANIM"):
+        return
+    w = term_width()
+    cw = 8                       # cat width incl. wagging tail
+    if w < cw + 12:
+        return                   # too narrow to be cute
+    h = 3
+    out = sys.stdout
+    target = w - cw - 1          # walk all the way to the right edge
+    step = max(1, target // 80)  # ~1 col/frame; coarser on very wide terminals
+    frames = max(1, target // step)
+    delay = min(0.04, max(0.012, 1.2 / frames))
+    g = lambda s: gradient(s, CLAY_LITE, CLAY)
+    try:
+        out.write("\033[?25l")              # hide cursor
+        out.write("\n" * h)                 # reserve drawing area
+        for i in range(frames + 1):
+            x = min(target, i * step)
+            eyes = "-.-" if i % 9 == 5 else "o.o"      # occasional blink
+            tail = "~ " if i % 2 else " ~"             # wag
+            cat = [" /\\_/\\ ", f"( {eyes} )", f" > ^ <{tail}"]
+            out.write(f"\033[{h}A")                     # up to top of area
+            for ln in cat:
+                out.write("\033[2K" + " " * x + g(ln) + "\n")
+            out.flush()
+            time.sleep(delay)
+        # stop at the right edge — happy face, with the meow trailing behind it
+        meow = clay("meow~ ♪ ")                          # 8 visible cols
+        pad = " " * max(0, target - 8)
+        arrival = [
+            " " * target + g(" /\\_/\\ "),
+            pad + meow + g("( ^.^ )"),
+            " " * target + g(" > ^ <  "),
+        ]
+        out.write(f"\033[{h}A")
+        for ln in arrival:
+            out.write("\033[2K" + ln + "\n")
+        out.flush()
+        time.sleep(0.4)
+    except Exception:
+        pass
+    finally:
+        try:
+            out.write("\033[?25h")          # always restore cursor
+            out.flush()
+        except Exception:
+            pass
+
 def render_help():
     rows = [
         ("login",   "[name]",       "Sign in fresh, then save as a profile"),
@@ -302,6 +353,9 @@ def render_help():
         ("current", "",             "Show the active account" + dim("  (alias: whoami)")),
         ("rename",  "<old> <new>",  "Rename a saved profile"),
         ("remove",  "<name>",       "Delete a saved profile" + dim("  (alias: rm)")),
+        ("doctor",  "",             "Health-check your setup"),
+        ("completion", "[bash|zsh]", "Output shell completion"),
+        ("commands", "",            "Show all commands (cheat sheet)"),
     ]
     cw = max(len(c) for c, _, _ in rows)
     aw = max(len(a) for _, a, _ in rows)
@@ -1224,11 +1278,208 @@ def cmd_autoswitch(args):
     else:  # status
         _autoswitch_status(idx, cfg)
 
+# ─────────────────────────────── doctor ───────────────────────────────────
+
+def cmd_doctor(args):
+    idx = load_index()
+    counts = {"ok": 0, "warn": 0, "fail": 0}
+
+    def check(state, label, detail=""):
+        mark = {"ok": green("✓"), "warn": yellow("!"), "fail": red("✗")}[state]
+        counts[state] += 1
+        line = IND + mark + " " + label
+        if detail:
+            line += dim("   " + detail)
+        info(line)
+
+    info()
+    info(IND + bold(clay("Doctor")) + dim("   ·   checking your setup"))
+    info()
+
+    # platform
+    check("ok" if sys.platform == "darwin" else "fail", "macOS",
+          sys.platform if sys.platform != "darwin" else "")
+
+    # claude CLI (needed for `login`)
+    cpath = shutil.which("claude")
+    if cpath:
+        ver = subprocess.run(["claude", "--version"], capture_output=True, text=True).stdout.strip()
+        check("ok", "claude CLI", ver or cpath)
+    else:
+        check("warn", "claude CLI", "not on PATH (only `login` needs it)")
+
+    # claude-auth itself on PATH (hooks + statusline call it by name)
+    capath = shutil.which("claude-auth")
+    check("ok" if capath else "warn", "claude-auth on PATH",
+          capath or "not found — hooks/statusline may fail")
+
+    # keychain access
+    blob, acct = read_live_credential()
+    check("ok" if blob else "fail", "Keychain access",
+          f"live credential present ({acct})" if blob else "no live credential — run `claude auth login`")
+
+    # saved accounts
+    n = len(idx["accounts"])
+    check("ok" if n else "warn", f"{n} account(s) saved",
+          "" if n else "run `claude-auth add` or `login`")
+
+    # active account
+    active = active_name(idx)
+    check("ok" if active else "warn", "active account",
+          active or "current login isn't saved as a profile (run `claude-auth add`)")
+
+    # autoswitch + hooks
+    cfg = _as_config(idx)
+    if cfg["enabled"]:
+        hn = _hook_installed()
+        check("ok" if hn == 2 else "warn", "autoswitch",
+              "Stop + SessionStart hooks present" if hn == 2
+              else f"enabled but {hn}/2 hooks — re-run `claude-auth autoswitch on`")
+    else:
+        check("ok", "autoswitch", "disabled")
+
+    # statusline wiring (informational)
+    slcmd = (_read_settings().get("statusLine") or {}).get("command", "")
+    if "claude-auth statusline" in slcmd:
+        check("ok", "statusline", "wired into settings.json")
+
+    # per-account token freshness (offline — reads keychain, no network)
+    if idx["accounts"]:
+        info()
+        info(IND + dim("accounts:"))
+        for name in sorted(idx["accounts"]):
+            raw = kc_read(STORE_SERVICE, name)
+            if raw is None:
+                check("warn", name, "backup missing from Keychain")
+                continue
+            cred = json.loads(raw).get("claudeAiOauth", {})
+            exp = cred.get("expiresAt")
+            fresh = exp and exp / 1000 > time.time()
+            if name == active:
+                check("ok", name, "active (managed live by Claude Code)")
+            elif fresh:
+                check("ok", name, "token valid")
+            else:
+                check("warn", name, "token stale — refreshes on next use, or `claude-auth refresh " + name + "`")
+
+    info()
+    summary = f"{counts['ok']} ok"
+    if counts["warn"]:
+        summary += f" · {counts['warn']} warning(s)"
+    if counts["fail"]:
+        summary += f" · {counts['fail']} error(s)"
+    tone = red if counts["fail"] else (yellow if counts["warn"] else green)
+    info(IND + tone("●") + " " + tone(summary))
+    info()
+
+# ──────────────────────────── shell completion ────────────────────────────
+
+_BASH_COMPLETION = r'''
+_claude_auth() {
+  local cur prev cmds sub
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  cmds="login add list ls switch usage autoswitch refresh statusline current whoami rename remove rm doctor completion help"
+  if [ "$COMP_CWORD" -eq 1 ]; then
+    COMPREPLY=( $(compgen -W "$cmds" -- "$cur") ); return
+  fi
+  sub="${COMP_WORDS[1]}"
+  case "$sub" in
+    switch|usage|rename|remove|rm|refresh)
+      COMPREPLY=( $(compgen -W "$(claude-auth completion --names 2>/dev/null)" -- "$cur") ) ;;
+    autoswitch) COMPREPLY=( $(compgen -W "on off status run" -- "$cur") ) ;;
+    completion) COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") ) ;;
+  esac
+}
+complete -F _claude_auth claude-auth
+'''.strip()
+
+_ZSH_COMPLETION = r'''
+_claude_auth() {
+  local -a cmds
+  cmds=(login add list ls switch usage autoswitch refresh statusline current whoami rename remove rm doctor completion)
+  if (( CURRENT == 2 )); then compadd -- $cmds; return; fi
+  case "${words[2]}" in
+    switch|usage|rename|remove|rm|refresh)
+      compadd -- ${(f)"$(claude-auth completion --names 2>/dev/null)"} ;;
+    autoswitch) compadd -- on off status run ;;
+    completion) compadd -- bash zsh ;;
+  esac
+}
+compdef _claude_auth claude-auth
+'''.strip()
+
+_COMMAND_REFERENCE = [
+    ("ACCOUNTS", [
+        ("login",   "[name]",      "Sign in fresh and save as a profile", "--email --console --sso"),
+        ("add",     "[name]",      "Save the currently logged-in account", "--force"),
+        ("switch",  "[name]",      "Switch to a saved account", "--force --no-save"),
+        ("list",    "",            "List saved accounts", "alias: ls"),
+        ("current", "",            "Show the active account", "alias: whoami"),
+        ("rename",  "<old> <new>", "Rename a saved profile", ""),
+        ("remove",  "<name>",      "Delete a saved profile", "--force · alias: rm"),
+    ]),
+    ("USAGE & LIMITS", [
+        ("usage",      "[name]",   "Show rate-limit usage across accounts", "--quiet"),
+        ("refresh",    "[name]",   "Refresh stored tokens of inactive accounts", ""),
+        ("autoswitch", "[on|off]", "Auto-switch when usage gets high", "status|run · --threshold --window --strategy"),
+    ]),
+    ("SETUP & INTEGRATION", [
+        ("statusline", "",         "Compact status line for Claude Code", "--plain"),
+        ("completion", "[bash|zsh]", "Output a shell-completion script", ""),
+        ("doctor",     "",         "Health-check your setup", ""),
+    ]),
+    ("MISC", [
+        ("commands",   "",         "Show this command reference", ""),
+        ("--help, -h", "",         "Full help screen", "with a cat 🐈"),
+        ("--version",  "",         "Print the version", "alias: -V"),
+    ]),
+]
+
+def cmd_commands(args):
+    rows = [r for _, group in _COMMAND_REFERENCE for r in group]
+    nw = max(len(r[0]) for r in rows)
+    aw = max(len(r[1]) for r in rows)
+    info()
+    info(IND + bold(clay("Commands")) + dim(f"   ·   claude-auth v{__version__}"))
+    for title, group in _COMMAND_REFERENCE:
+        info()
+        info(IND + bold(clay(title)))
+        for name, a, desc, extra in group:
+            line = IND * 2 + bold(ink(vpad(name, nw))) + "  " + dim(vpad(a, aw)) + "  " + desc
+            if extra:
+                line += dim("   " + extra)
+            info(line)
+    info()
+    info(IND + dim("docs   ") + cyan(REPO))
+    info()
+
+def cmd_completion(args):
+    if args.names:
+        print("\n".join(sorted(load_index()["accounts"])))
+        return
+    if args.shell == "zsh":
+        print(_ZSH_COMPLETION)
+    elif args.shell == "bash":
+        print(_BASH_COMPLETION)
+    else:
+        info()
+        info(IND + bold(clay("Shell completion")) + dim("   ·   tab-complete commands & account names"))
+        info()
+        info(IND + dim("zsh") + "  — add to " + ink("~/.zshrc") + ":")
+        info(IND * 2 + clay('eval "$(claude-auth completion zsh)"'))
+        info()
+        info(IND + dim("bash") + " — add to " + ink("~/.bashrc") + ":")
+        info(IND * 2 + clay('eval "$(claude-auth completion bash)"'))
+        info()
+
 # ──────────────────────────── arg parsing ─────────────────────────────────
 
 class BrandParser(argparse.ArgumentParser):
     def format_help(self):
         return render_help() + "\n"
+    def print_help(self, file=None):
+        _play_cat()
+        (file or sys.stdout).write(self.format_help())
     def error(self, message):
         die(message + dim("   ·   see ") + clay("claude-auth --help"), code=2)
 
@@ -1308,6 +1559,17 @@ def build_parser():
                         help="remove even if it's the active account")
         rm.set_defaults(func=cmd_remove)
 
+    dr = sub.add_parser("doctor", help="health-check your setup")
+    dr.set_defaults(func=cmd_doctor)
+
+    cm = sub.add_parser("commands", help="show all commands (cheat sheet)")
+    cm.set_defaults(func=cmd_commands)
+
+    comp = sub.add_parser("completion", help="output shell completion (bash|zsh)")
+    comp.add_argument("shell", nargs="?", choices=["bash", "zsh"])
+    comp.add_argument("--names", action="store_true", help=argparse.SUPPRESS)
+    comp.set_defaults(func=cmd_completion)
+
     return p
 
 def main():
@@ -1316,6 +1578,7 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
     if not getattr(args, "func", None):
+        _play_cat()
         print(render_help())
         sys.exit(0)
     args.func(args)
