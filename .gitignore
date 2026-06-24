@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Local account data (should NEVER be committed — lives in the user's home dir,
+# but listed here as a guard in case anyone copies it into the repo)
+.claude-accounts/
+accounts.json
+*.tmp

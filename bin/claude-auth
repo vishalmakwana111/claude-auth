@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+"""
+claude-auth — switch between multiple Claude Code accounts on one machine.
+
+Like `gh auth switch`, but for Claude Code. Snapshots the currently logged-in
+account (Keychain credential blob + ~/.claude.json identity) into a named
+profile, and restores any saved profile on demand.
+
+macOS only (uses the login Keychain via the `security` CLI). Secret tokens stay
+in the Keychain; only non-secret identity metadata is kept in a plaintext index.
+
+Commands:
+  claude-auth login [name]      Sign in fresh and save the result as a profile
+  claude-auth add [name]        Save the current account as a named profile
+  claude-auth list | ls         List saved accounts (* = active)
+  claude-auth switch [name]     Switch to a saved account (interactive if omitted)
+  claude-auth current | whoami  Show the active account
+  claude-auth rename <old> <new>
+  claude-auth remove | rm <name>
+"""
+
+import sys
+import os
+import json
+import time
+import getpass
+import subprocess
+import argparse
+
+HOME = os.path.expanduser("~")
+CLAUDE_JSON = os.path.join(HOME, ".claude.json")
+STORE_DIR = os.path.join(HOME, ".claude-accounts")
+INDEX_PATH = os.path.join(STORE_DIR, "accounts.json")
+
+LIVE_SERVICE = "Claude Code-credentials"   # the item Claude Code itself reads
+STORE_SERVICE = "claude-auth-store"         # our namespaced backups, per account
+
+# ---- pretty output -------------------------------------------------------
+
+_TTY = sys.stdout.isatty()
+def _c(code, s):
+    return f"\033[{code}m{s}\033[0m" if _TTY else s
+def bold(s):   return _c("1", s)
+def dim(s):    return _c("2", s)
+def green(s):  return _c("32", s)
+def cyan(s):   return _c("36", s)
+def red(s):    return _c("31", s)
+def yellow(s): return _c("33", s)
+
+def die(msg, code=1):
+    print(red("error: ") + msg, file=sys.stderr)
+    sys.exit(code)
+
+def info(msg):
+    print(msg)
+
+# ---- keychain ------------------------------------------------------------
+
+def _kc_account_for_live():
+    """The macOS account name the live credential item is stored under."""
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", LIVE_SERVICE],
+            capture_output=True, text=True,
+        ).stdout
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith('"acct"<blob>='):
+                val = line.split("=", 1)[1].strip()
+                if val.startswith('"') and val.endswith('"'):
+                    return val[1:-1]
+    except Exception:
+        pass
+    return getpass.getuser()
+
+def kc_read(service, account):
+    """Return the password string for a keychain item, or None if absent."""
+    r = subprocess.run(
+        ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return None
+    return r.stdout.rstrip("\n")
+
+def kc_write(service, account, secret, label=None):
+    """Create or update a keychain item in place (-U preserves ACL)."""
+    cmd = ["security", "add-generic-password", "-U",
+           "-s", service, "-a", account, "-w", secret]
+    if label:
+        cmd += ["-l", label]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"keychain write failed: {r.stderr.strip()}")
+
+def kc_delete(service, account):
+    subprocess.run(
+        ["security", "delete-generic-password", "-s", service, "-a", account],
+        capture_output=True, text=True,
+    )
+
+# ---- live credential + identity -----------------------------------------
+
+def read_live_credential():
+    acct = _kc_account_for_live()
+    raw = kc_read(LIVE_SERVICE, acct)
+    if raw is None:
+        return None, acct
+    try:
+        return json.loads(raw), acct
+    except json.JSONDecodeError:
+        die("live Keychain credential is not valid JSON")
+
+def write_live_credential(blob, acct):
+    kc_write(LIVE_SERVICE, acct, json.dumps(blob), label=LIVE_SERVICE)
+
+def read_claude_json():
+    try:
+        with open(CLAUDE_JSON) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        die(f"{CLAUDE_JSON} is not valid JSON")
+
+def write_claude_json(data):
+    # atomic-ish write to avoid corrupting the (large) config on crash
+    tmp = CLAUDE_JSON + ".claude-auth.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, CLAUDE_JSON)
+
+def current_identity():
+    """(oauthAccount dict, userID) for the currently logged-in account."""
+    cj = read_claude_json()
+    return cj.get("oauthAccount") or {}, cj.get("userID")
+
+# ---- index ---------------------------------------------------------------
+
+def load_index():
+    try:
+        with open(INDEX_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"accounts": {}}
+    except json.JSONDecodeError:
+        die(f"{INDEX_PATH} is corrupt")
+
+def save_index(idx):
+    os.makedirs(STORE_DIR, exist_ok=True)
+    try:
+        os.chmod(STORE_DIR, 0o700)
+    except OSError:
+        pass
+    tmp = INDEX_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(idx, f, indent=2)
+    os.replace(tmp, INDEX_PATH)
+    try:
+        os.chmod(INDEX_PATH, 0o600)
+    except OSError:
+        pass
+
+def active_name(idx):
+    """Name of the saved profile matching the live identity, or None."""
+    oauth, _ = current_identity()
+    uuid = oauth.get("accountUuid")
+    if not uuid:
+        return None
+    for name, p in idx["accounts"].items():
+        if p.get("accountUuid") == uuid:
+            return name
+    return None
+
+# ---- snapshot / restore --------------------------------------------------
+
+def snapshot_into(name, idx, *, quiet=False):
+    """Capture the live account into profile `name`."""
+    blob, _ = read_live_credential()
+    if blob is None:
+        die("no live Claude Code credential found in Keychain — log in first")
+    oauth, user_id = current_identity()
+
+    kc_write(STORE_SERVICE, name, json.dumps(blob), label=f"claude-auth: {name}")
+    cred = blob.get("claudeAiOauth", {})
+    idx["accounts"][name] = {
+        "email": oauth.get("emailAddress"),
+        "organizationName": oauth.get("organizationName"),
+        "accountUuid": oauth.get("accountUuid"),
+        "userID": user_id,
+        "subscriptionType": cred.get("subscriptionType"),
+        "expiresAt": cred.get("expiresAt"),
+        "oauthAccount": oauth,
+        "addedAt": idx["accounts"].get(name, {}).get("addedAt", int(time.time())),
+        "updatedAt": int(time.time()),
+    }
+    save_index(idx)
+    if not quiet:
+        info(f"saved {bold(name)}  {dim('(' + (oauth.get('emailAddress') or '?') + ')')}")
+
+def restore(name, idx):
+    """Make profile `name` the active account."""
+    if name not in idx["accounts"]:
+        die(f"no such account: {name}")
+    raw = kc_read(STORE_SERVICE, name)
+    if raw is None:
+        die(f"stored credential for {name} is missing from Keychain (was it deleted?)")
+    blob = json.loads(raw)
+
+    _, acct = read_live_credential()
+    write_live_credential(blob, acct)
+
+    # restore identity into ~/.claude.json so the displayed account is correct
+    prof = idx["accounts"][name]
+    cj = read_claude_json()
+    if prof.get("oauthAccount"):
+        cj["oauthAccount"] = prof["oauthAccount"]
+    if prof.get("userID") is not None:
+        cj["userID"] = prof["userID"]
+    write_claude_json(cj)
+
+# ---- commands ------------------------------------------------------------
+
+def cmd_login(args):
+    """Drive `claude auth login`, then save whatever account we land on."""
+    idx = load_index()
+
+    # don't lose the outgoing account — login overwrites the live credential
+    active = active_name(idx)
+    if active:
+        snapshot_into(active, idx, quiet=True)
+    prev_oauth, _ = current_identity()
+    prev_uuid = prev_oauth.get("accountUuid")
+
+    cmd = ["claude", "auth", "login"]
+    if args.console:
+        cmd.append("--console")
+    if args.sso:
+        cmd.append("--sso")
+    if args.email:
+        cmd += ["--email", args.email]
+
+    info(dim("launching `claude auth login` — complete sign-in in your browser…\n"))
+    try:
+        r = subprocess.run(cmd)
+    except FileNotFoundError:
+        die("`claude` CLI not found on PATH")
+    if r.returncode != 0:
+        die("login was cancelled or failed; nothing saved")
+
+    new_oauth, _ = current_identity()
+    new_uuid = new_oauth.get("accountUuid")
+    if not new_uuid:
+        die("login finished but no account could be read — try `claude-auth add`")
+
+    email = new_oauth.get("emailAddress") or ""
+    name = args.name or (email.split("@")[0] if email else None)
+    if not name:
+        die("could not infer a name; pass one: claude-auth login <name>")
+
+    for n, p in idx["accounts"].items():
+        if p.get("accountUuid") == new_uuid and n != name:
+            info(yellow(f"note: this account is already saved as '{n}'"))
+
+    print()
+    snapshot_into(name, idx)
+    if prev_uuid and prev_uuid == new_uuid:
+        info(dim("(same account as before — refreshed its stored tokens)"))
+
+def cmd_add(args):
+    idx = load_index()
+    oauth, _ = current_identity()
+    email = oauth.get("emailAddress") or ""
+    name = args.name or (email.split("@")[0] if email else None)
+    if not name:
+        die("could not infer a name; pass one: claude-auth add <name>")
+    if name in idx["accounts"] and not args.force:
+        die(f"'{name}' already exists; use a different name or --force to overwrite")
+    snapshot_into(name, idx)
+
+def cmd_list(args):
+    idx = load_index()
+    accts = idx["accounts"]
+    if not accts:
+        info(dim("no saved accounts. Run `claude-auth add` while logged in."))
+        return
+    active = active_name(idx)
+    now = time.time()
+    name_w = max(len(n) for n in accts) + 1
+    for name, p in sorted(accts.items()):
+        mark = green("*") if name == active else " "
+        email = p.get("email") or dim("?")
+        org = p.get("organizationName") or ""
+        exp = p.get("expiresAt")
+        if exp and exp / 1000 < now:
+            status = red("expired")
+        else:
+            status = dim(p.get("subscriptionType") or "")
+        line = f"{mark} {bold(name.ljust(name_w))} {email}"
+        if org:
+            line += dim(f"  · {org}")
+        if status:
+            line += f"  {status}"
+        info(line)
+    if not active:
+        info(dim("\n(active account doesn't match any saved profile — `claude-auth add` to save it)"))
+
+def cmd_current(args):
+    idx = load_index()
+    active = active_name(idx)
+    oauth, _ = current_identity()
+    email = oauth.get("emailAddress")
+    if active:
+        info(f"{bold(active)}  {dim('(' + (email or '?') + ')')}")
+    elif email:
+        info(f"{email} {dim('(not saved — run `claude-auth add`)')}")
+    else:
+        info(dim("not logged in"))
+
+def cmd_switch(args):
+    idx = load_index()
+    accts = idx["accounts"]
+    if not accts:
+        die("no saved accounts yet. Run `claude-auth add` while logged in.")
+
+    name = args.name
+    if not name:
+        name = _interactive_pick(idx)
+        if not name:
+            return
+
+    if name not in accts:
+        die(f"no such account: {name}")
+
+    active = active_name(idx)
+    if active == name and not args.force:
+        info(dim(f"already on {bold(name)}"))
+        return
+
+    # keep the outgoing account's stored copy fresh (tokens rotate, MCP auth, etc.)
+    if active and not args.no_save:
+        snapshot_into(active, idx, quiet=True)
+
+    restore(name, idx)
+    p = accts[name]
+    info(f"{green('✓')} switched to {bold(name)}  {dim('(' + (p.get('email') or '?') + ')')}")
+    info(dim("  restart Claude Code (and any running sessions) to use this account."))
+
+def _interactive_pick(idx):
+    accts = sorted(idx["accounts"].items())
+    active = active_name(idx)
+    info(bold("Select an account:"))
+    for i, (name, p) in enumerate(accts, 1):
+        mark = green("*") if name == active else " "
+        info(f"  {mark} {cyan(str(i))}. {bold(name)}  {dim('(' + (p.get('email') or '?') + ')')}")
+    try:
+        choice = input("> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        info("")
+        return None
+    if not choice:
+        return None
+    if choice.isdigit() and 1 <= int(choice) <= len(accts):
+        return accts[int(choice) - 1][0]
+    if choice in idx["accounts"]:
+        return choice
+    die(f"invalid selection: {choice}")
+
+def cmd_rename(args):
+    idx = load_index()
+    if args.old not in idx["accounts"]:
+        die(f"no such account: {args.old}")
+    if args.new in idx["accounts"]:
+        die(f"'{args.new}' already exists")
+    raw = kc_read(STORE_SERVICE, args.old)
+    if raw is not None:
+        kc_write(STORE_SERVICE, args.new, raw, label=f"claude-auth: {args.new}")
+        kc_delete(STORE_SERVICE, args.old)
+    idx["accounts"][args.new] = idx["accounts"].pop(args.old)
+    save_index(idx)
+    info(f"renamed {bold(args.old)} → {bold(args.new)}")
+
+def cmd_remove(args):
+    idx = load_index()
+    if args.name not in idx["accounts"]:
+        die(f"no such account: {args.name}")
+    if active_name(idx) == args.name and not args.force:
+        die(f"'{args.name}' is the active account; use --force to remove it anyway")
+    kc_delete(STORE_SERVICE, args.name)
+    del idx["accounts"][args.name]
+    save_index(idx)
+    info(f"removed {bold(args.name)}")
+
+# ---- arg parsing ---------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="claude-auth",
+        description="Switch between multiple Claude Code accounts (macOS).",
+    )
+    sub = p.add_subparsers(dest="cmd")
+
+    lg = sub.add_parser("login", help="sign in fresh and save the result as a profile")
+    lg.add_argument("name", nargs="?", help="profile name (default: email prefix)")
+    lg.add_argument("--email", help="pre-populate the email on the login page")
+    lg.add_argument("--console", action="store_true",
+                    help="use Anthropic Console (API billing) instead of subscription")
+    lg.add_argument("--sso", action="store_true", help="force the SSO login flow")
+    lg.set_defaults(func=cmd_login)
+
+    a = sub.add_parser("add", help="save the current account as a named profile")
+    a.add_argument("name", nargs="?", help="profile name (default: email prefix)")
+    a.add_argument("-f", "--force", action="store_true", help="overwrite if exists")
+    a.set_defaults(func=cmd_add)
+
+    for alias in ("list", "ls"):
+        l = sub.add_parser(alias, help="list saved accounts")
+        l.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("switch", help="switch to a saved account")
+    s.add_argument("name", nargs="?", help="account to switch to (interactive if omitted)")
+    s.add_argument("-f", "--force", action="store_true", help="switch even if already active")
+    s.add_argument("--no-save", action="store_true",
+                   help="don't refresh the outgoing account's stored copy")
+    s.set_defaults(func=cmd_switch)
+
+    for alias in ("current", "whoami"):
+        c = sub.add_parser(alias, help="show the active account")
+        c.set_defaults(func=cmd_current)
+
+    rn = sub.add_parser("rename", help="rename a saved account")
+    rn.add_argument("old")
+    rn.add_argument("new")
+    rn.set_defaults(func=cmd_rename)
+
+    for alias in ("remove", "rm"):
+        rm = sub.add_parser(alias, help="delete a saved account")
+        rm.add_argument("name")
+        rm.add_argument("-f", "--force", action="store_true",
+                        help="remove even if it's the active account")
+        rm.set_defaults(func=cmd_remove)
+
+    return p
+
+def main():
+    if sys.platform != "darwin":
+        die("claude-auth currently supports macOS only (uses the login Keychain).")
+    parser = build_parser()
+    args = parser.parse_args()
+    if not getattr(args, "func", None):
+        parser.print_help()
+        sys.exit(0)
+    args.func(args)
+
+if __name__ == "__main__":
+    main()
