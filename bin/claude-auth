@@ -24,7 +24,7 @@ import urllib.error
 import concurrent.futures
 from datetime import datetime, timezone
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 API_USAGE = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_BETA = "oauth-2025-04-20"
@@ -32,8 +32,18 @@ ANTHROPIC_VERSION = "2023-06-01"
 
 HOME = os.path.expanduser("~")
 CLAUDE_JSON = os.path.join(HOME, ".claude.json")
+SETTINGS = os.path.join(HOME, ".claude", "settings.json")
 STORE_DIR = os.path.join(HOME, ".claude-accounts")
 INDEX_PATH = os.path.join(STORE_DIR, "accounts.json")
+
+AUTOSWITCH_DEFAULTS = {
+    "enabled": False,
+    "threshold": 90,        # switch when usage exceeds this %
+    "window": "session",    # which limit to watch: session | week
+    "strategy": "next",     # next = round-robin, lowest = most headroom
+    "intervalSec": 120,     # minimum seconds between checks
+    "lastCheckAt": 0,
+}
 
 LIVE_SERVICE = "Claude Code-credentials"   # the item Claude Code itself reads
 STORE_SERVICE = "claude-auth-store"         # our namespaced backups, per account
@@ -237,6 +247,7 @@ def render_help():
         ("add",     "[name]",       "Save the currently logged-in account"),
         ("switch",  "[name]",       "Switch to a saved account"),
         ("usage",   "[name]",       "Show rate-limit usage across accounts"),
+        ("autoswitch", "[on|off]",  "Auto-switch accounts when usage gets high"),
         ("list",    "",             "List saved accounts" + dim("  (alias: ls)")),
         ("current", "",             "Show the active account" + dim("  (alias: whoami)")),
         ("rename",  "<old> <new>",  "Rename a saved profile"),
@@ -824,6 +835,247 @@ def cmd_remove(args):
     ok(f"Removed {bold(args.name)}")
     info()
 
+# ─────────────────────────── auto-switch ──────────────────────────────────
+
+def _as_config(idx):
+    cfg = idx.setdefault("config", {}).setdefault("autoswitch", {})
+    for k, v in AUTOSWITCH_DEFAULTS.items():
+        cfg.setdefault(k, v)
+    return cfg
+
+def _usage_pct(name, idx, active, window):
+    """Live usage % for `name` on `window`; caches the snapshot. (pct, err)."""
+    tok = _token_for(name, idx, active)
+    if not tok:
+        return None, "no token"
+    data, err = fetch_usage(tok)
+    if data is None:
+        return None, err
+    norm = parse_usage(data)
+    norm["fetchedAt"] = int(time.time())
+    idx["accounts"][name]["usage"] = norm
+    w = norm.get(window)
+    return (w["pct"] if w else None), None
+
+def _notify(title, msg):
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f"display notification {json.dumps(msg)} with title {json.dumps(title)}"],
+            capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+def _as_log(msg):
+    try:
+        os.makedirs(STORE_DIR, exist_ok=True)
+        ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        with open(os.path.join(STORE_DIR, "autoswitch.log"), "a") as f:
+            f.write(f"{ts}  {msg}\n")
+    except Exception:
+        pass
+
+# ---- settings.json hook management ----
+
+def _bin_path():
+    return shutil.which("claude-auth") or os.path.join(HOME, ".local/bin/claude-auth")
+
+def _hook_command():
+    return f"nohup {_bin_path()} autoswitch run --quiet >/dev/null 2>&1 &"
+
+def _read_settings():
+    try:
+        with open(SETTINGS) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        die(f"{SETTINGS} is not valid JSON")
+
+def _write_settings(data):
+    os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
+    tmp = SETTINGS + ".claude-auth.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, SETTINGS)
+
+def _hook_is_ours(h):
+    return isinstance(h, dict) and "claude-auth" in h.get("command", "") \
+        and "autoswitch" in h.get("command", "")
+
+def _install_hook():
+    s = _read_settings()
+    stop = s.setdefault("hooks", {}).setdefault("Stop", [])
+    for group in stop:
+        for h in group.get("hooks", []):
+            if _hook_is_ours(h):
+                h["command"] = _hook_command()   # refresh in case path changed
+                _write_settings(s)
+                return False
+    stop.append({"hooks": [{"type": "command", "command": _hook_command()}]})
+    _write_settings(s)
+    return True
+
+def _uninstall_hook():
+    s = _read_settings()
+    stop = s.get("hooks", {}).get("Stop")
+    if not stop:
+        return
+    new_stop = []
+    for group in stop:
+        kept = [h for h in group.get("hooks", []) if not _hook_is_ours(h)]
+        if kept:
+            group["hooks"] = kept
+            new_stop.append(group)
+    if new_stop:
+        s["hooks"]["Stop"] = new_stop
+    else:
+        s["hooks"].pop("Stop", None)
+        if not s["hooks"]:
+            s.pop("hooks", None)
+    _write_settings(s)
+
+def _hook_installed():
+    for group in _read_settings().get("hooks", {}).get("Stop", []):
+        if any(_hook_is_ours(h) for h in group.get("hooks", [])):
+            return True
+    return False
+
+# ---- the check itself (invoked by the Stop hook) ----
+
+def _autoswitch_run(args):
+    idx = load_index()
+    cfg = _as_config(idx)
+    if not cfg["enabled"] and not args.force:
+        return
+    now = int(time.time())
+    if not args.force and now - cfg.get("lastCheckAt", 0) < cfg["intervalSec"]:
+        return
+    cfg["lastCheckAt"] = now
+    save_index(idx)
+
+    active = active_name(idx)
+    if not active or active not in idx["accounts"]:
+        return
+    window = args.window or cfg["window"]
+    thr = args.threshold if args.threshold is not None else cfg["threshold"]
+
+    cur, err = _usage_pct(active, idx, active, window)
+    save_index(idx)
+    if cur is None:
+        _as_log(f"skip: {active} usage unavailable ({err})")
+        if not args.quiet:
+            warn(f"usage unavailable for {active} ({err})")
+        return
+    if cur < thr:
+        if not args.quiet:
+            info()
+            step(f"{bold(active)} at {cur:.0f}% {window} — under {thr}%, no switch")
+            info()
+        return
+
+    # over threshold → score the other accounts
+    scored = []
+    for n in idx["accounts"]:
+        if n != active:
+            pct, _e = _usage_pct(n, idx, active, window)
+            scored.append((n, pct))
+    save_index(idx)
+    eligible = [(n, p) for n, p in scored if p is not None and p < thr]
+    if not eligible:
+        _as_log(f"{active} at {cur:.0f}% but no account under {thr}% — staying")
+        _notify("claude-auth", f"{active} at {cur:.0f}% — all accounts near limit, can't switch")
+        if not args.quiet:
+            warn(f"{active} at {cur:.0f}% but no account is under {thr}%")
+        return
+
+    if cfg["strategy"] == "lowest":
+        target = min(eligible, key=lambda x: x[1])[0]
+    else:  # round-robin "next"
+        order = sorted(idx["accounts"])
+        i = order.index(active)
+        rotation = order[i + 1:] + order[:i]
+        elig = {n for n, _ in eligible}
+        target = next((n for n in rotation if n in elig), eligible[0][0])
+    tgt_pct = dict(eligible)[target]
+
+    if args.dry_run:
+        msg = f"would switch {active} ({cur:.0f}%) → {target} ({tgt_pct:.0f}%)"
+        _as_log("dry-run: " + msg)
+        info()
+        step(msg + dim("  (dry run — no change made)"))
+        info()
+        return
+
+    snapshot_into(active, idx, quiet=True)
+    restore(target, idx)
+    _as_log(f"auto-switched {active} ({cur:.0f}%) → {target} ({tgt_pct:.0f}%)")
+    _notify("claude-auth",
+            f"Switched {active} → {target} ({window} {cur:.0f}%). Restart Claude Code to use it.")
+    if not args.quiet:
+        info()
+        ok(f"Auto-switched {bold(active)} → {bold(clay(target))}  {dim(f'{window} {cur:.0f}%')}")
+        hint("↻ restart Claude Code to use the new account")
+        info()
+
+def _autoswitch_status(idx, cfg):
+    on = cfg["enabled"]
+    info()
+    info(IND + (green("●") if on else dim("○")) + " " + bold(clay("Auto-switch")) +
+         "  " + (green("enabled") if on else dim("disabled")))
+    info()
+    field = lambda k: dim(vpad(k, 12))
+    info(IND * 2 + field("threshold") + " " + ink(f"{cfg['threshold']}%") +
+         dim(f"  of {cfg['window']} usage"))
+    info(IND * 2 + field("strategy") + " " + ink(cfg["strategy"]) +
+         dim("  (next = round-robin · lowest = most headroom)"))
+    info(IND * 2 + field("interval") + " " + ink(f"{cfg['intervalSec']}s") +
+         dim("  min between checks"))
+    info(IND * 2 + field("hook") + " " +
+         (green("installed") if _hook_installed() else yellow("missing")))
+    last = cfg.get("lastCheckAt") or 0
+    info(IND * 2 + field("last check") + " " + dim(rel_time(last) if last else "never"))
+    info()
+    if on:
+        hint("runs when Claude goes idle (Stop hook) · a switch applies on next restart")
+    else:
+        hint("enable with " + clay("claude-auth autoswitch on"))
+    info()
+
+def cmd_autoswitch(args):
+    if args.action == "run":
+        _autoswitch_run(args)
+        return
+    idx = load_index()
+    cfg = _as_config(idx)
+    if args.action == "on":
+        cfg["enabled"] = True
+        if args.threshold is not None:
+            cfg["threshold"] = args.threshold
+        if args.window:
+            cfg["window"] = args.window
+        if args.strategy:
+            cfg["strategy"] = args.strategy
+        if args.interval is not None:
+            cfg["intervalSec"] = args.interval
+        save_index(idx)
+        installed = _install_hook()
+        info()
+        ok(f"Auto-switch enabled — switch above {bold(str(cfg['threshold']) + '%')} {cfg['window']} usage")
+        hint(f"strategy {cfg['strategy']} · checks at most every {cfg['intervalSec']}s when Claude is idle")
+        hint("Stop hook " + ("installed" if installed else "refreshed") + " in ~/.claude/settings.json")
+        hint("a switch swaps the credential; it applies on your next Claude Code session/restart")
+        info()
+    elif args.action == "off":
+        cfg["enabled"] = False
+        save_index(idx)
+        _uninstall_hook()
+        info()
+        ok("Auto-switch disabled " + dim("(Stop hook removed)"))
+        info()
+    else:  # status
+        _autoswitch_status(idx, cfg)
+
 # ──────────────────────────── arg parsing ─────────────────────────────────
 
 class BrandParser(argparse.ArgumentParser):
@@ -870,6 +1122,20 @@ def build_parser():
     u = sub.add_parser("usage", help="show rate-limit usage for your accounts")
     u.add_argument("name", nargs="?", help="account to detail (default: all)")
     u.set_defaults(func=cmd_usage)
+
+    asw = sub.add_parser("autoswitch", help="auto-switch when usage gets high")
+    asw.add_argument("action", nargs="?", default="status",
+                     choices=["on", "off", "status", "run"])
+    asw.add_argument("--threshold", type=int, help="switch above this usage %% (default 90)")
+    asw.add_argument("--window", choices=["session", "week"],
+                     help="which limit to watch (default session)")
+    asw.add_argument("--strategy", choices=["next", "lowest"],
+                     help="next = round-robin, lowest = most headroom")
+    asw.add_argument("--interval", type=int, help="min seconds between checks (default 120)")
+    asw.add_argument("--quiet", action="store_true", help="suppress output (used by the hook)")
+    asw.add_argument("--force", action="store_true", help="ignore enabled/throttle and run now")
+    asw.add_argument("--dry-run", action="store_true", help="decide and report, but don't switch")
+    asw.set_defaults(func=cmd_autoswitch)
 
     rn = sub.add_parser("rename", help="rename a saved account")
     rn.add_argument("old")

@@ -135,6 +135,7 @@ claude-auth switch personal
 | `claude-auth list` / `ls` | List saved accounts. `*` marks the active one. |
 | `claude-auth switch [name]` | Switch to a saved account. Interactive picker if no name. `--force`, `--no-save`. |
 | `claude-auth usage [name]` | Show rate-limit usage (session + weekly) across accounts. Detail view for one account. |
+| `claude-auth autoswitch on/off/status` | Auto-switch to another account when usage gets high. `--threshold`, `--window`, `--strategy`. |
 | `claude-auth current` / `whoami` | Show the active account. |
 | `claude-auth rename <old> <new>` | Rename a saved profile (moves its Keychain backup too). |
 | `claude-auth remove <name>` / `rm` | Delete a saved profile. `--force` to remove the active one. |
@@ -146,6 +147,29 @@ claude-auth switch personal
 - `login --sso` — force the SSO login flow
 - `switch --no-save` — don't refresh the outgoing account's stored copy before switching
 - `switch --force` — switch even if the target is already active
+
+### Auto-switch when you're running low
+
+Turn on auto-switch and `claude-auth` will move you to a fresher account before you hit a wall:
+
+```console
+$ claude-auth autoswitch on --threshold 90 --window session
+
+  ✓ Auto-switch enabled — switch above 90% session usage
+  strategy next · checks at most every 120s when Claude is idle
+  Stop hook installed in ~/.claude/settings.json
+```
+
+How it works:
+
+- It installs a **`Stop` hook** — Claude Code runs it the moment a response finishes and the session goes idle. That's the guarantee that **it never switches while a prompt is running**.
+- On each idle check (throttled, default every 120s) it reads the active account's usage. If it's over the threshold, it picks another account with headroom and swaps the credential.
+- `--strategy next` rotates round-robin; `--strategy lowest` jumps to the account with the most headroom. `--window` chooses `session` (5-hour) or `week`.
+- You get a macOS notification and a log line in `~/.claude-accounts/autoswitch.log`.
+
+> **Important:** switching swaps the on-disk credential — it can't move an *already-running* session to the new account (the token is held in memory). So an auto-switch takes effect on your **next** Claude Code session/restart. The notification reminds you to restart.
+
+Check status any time with `claude-auth autoswitch status`, preview a decision with `claude-auth autoswitch run --force --dry-run`, and turn it off with `claude-auth autoswitch off` (which removes the hook).
 
 ## How it works
 

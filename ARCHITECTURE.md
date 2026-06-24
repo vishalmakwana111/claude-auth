@@ -186,7 +186,54 @@ Two design points make this work cleanly:
 Bars are colored by severity (`< 50%` green, `< 80%` amber, `≥ 80%` red). The
 weekly window is highlighted because it's the limit that usually binds.
 
-## 7. The `security` CLI surface used
+## 7. Auto-switch
+
+`claude-auth autoswitch` moves you to a fresher account when the active one's
+usage crosses a threshold. The whole design hinges on **when** the check runs.
+
+**The "no active prompt" guarantee.** Switching is driven by a Claude Code
+**`Stop` hook**, registered in `~/.claude/settings.json`:
+
+```jsonc
+"hooks": {
+  "Stop": [
+    { "hooks": [
+        { "type": "command",
+          "command": "nohup /…/claude-auth autoswitch run --quiet >/dev/null 2>&1 &" }
+    ] }
+  ]
+}
+```
+
+The `Stop` hook fires precisely when Claude finishes a response and the session
+goes idle — so by construction there is no active prompt at switch time. The
+command is detached (`nohup … &`) so it adds zero latency to the turn.
+
+**The check (`autoswitch run`):**
+
+1. If disabled, or if the last check was under `intervalSec` ago (default 120s),
+   exit immediately — this throttles the API so frequent `Stop`s are cheap.
+2. Read the active account's usage on the configured `window` (`session` default).
+3. If under `threshold` (default 90%), do nothing.
+4. Otherwise fetch the other accounts' usage (each via its own stored token),
+   keep those under threshold, and pick a target:
+   - `next` — round-robin to the next account in order with headroom;
+   - `lowest` — the account with the most headroom.
+5. Snapshot the outgoing account, restore the target (§5), log to
+   `~/.claude-accounts/autoswitch.log`, and post a macOS notification.
+
+**The fundamental limitation.** A switch swaps the *on-disk* credential. A
+Claude Code process already running holds its token in memory and will not adopt
+a different account mid-session (§ "New-session scope"). So an auto-switch takes
+effect on the **next** session/restart — the notification says as much. What it
+buys you: when you do hit the wall and restart, you're already on a fresh
+account instead of having to manually find one and switch.
+
+Config lives in the index under `config.autoswitch`; the `Stop` hook is added and
+removed surgically (matched by the `claude-auth … autoswitch` substring) so the
+rest of `settings.json` is never touched.
+
+## 8. The `security` CLI surface used
 
 | Operation | Command |
 |-----------|---------|
@@ -197,7 +244,7 @@ weekly window is highlighted because it's the limit that usually binds.
 
 The macOS account name on the live item is detected dynamically (falling back to `getpass.getuser()`), so nothing about the local user is hardcoded.
 
-## 8. Known trade-offs
+## 9. Known trade-offs
 
 - **macOS only.** Linux Claude Code stores credentials in `~/.claude/.credentials.json` (plaintext). A Linux backend would swap the `kc_*` functions for file operations; the rest of the architecture (index, identity swap, auto-sync) carries over unchanged.
 - **`-w "<secret>"` exposure.** The secret is passed as a process argument, so it's briefly visible to `ps` for the same user during a write. Local-only and transient; eliminating it would require a Keychain API binding rather than the `security` CLI.
