@@ -270,7 +270,34 @@ session begins — if the credential swap completes before Claude reads it, the 
 session lands directly on a fresh account, narrowing the "applies next restart"
 gap. It's throttled like the Stop check, so it usually costs one quick usage call.
 
-## 9. The `security` CLI surface used
+## 9. The pool proxy
+
+`switch` and `autoswitch` change the credential *on disk*, which a running session never re-reads. `pool` sidesteps that entirely by moving the decision from disk to the network: it runs a local HTTP proxy and points Claude Code at it with `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (written into the `env` block of `~/.claude/settings.json`).
+
+```
+  Claude Code ──HTTP──▶ 127.0.0.1:8848 (claude-auth pool serve)
+                              │
+                              │  pick an account  (failover: active first; balance: round-robin)
+                              │  token_for(acct)  → refresh if expiring  (POST /v1/oauth/token)
+                              │  forward with  Authorization: Bearer <token>,  Host: api.anthropic.com
+                              ▼
+                        api.anthropic.com
+                              │
+                       429 ? ─┴─▶ mark account "resting" (Retry-After), pick next, retry SAME request
+                       2xx ? ───▶ stream response straight back (SSE-safe), tag X-Claude-Auth-Account
+```
+
+**The key correctness property:** the Messages API is *stateless* — the client resends the entire conversation each turn — so no server-side session exists to migrate. Routing turn *N* to account A and turn *N+1* to account B is transparent; each request just draws down its own account's rate-limit bucket. This is why pooling works where an on-disk swap can't: it's load-balancing over independent requests, not "moving" a session.
+
+Design notes:
+
+- **Process model.** `pool start` spawns a detached `pool serve` daemon (`ThreadingHTTPServer`, `daemon_threads=True`), records its pid in `~/.claude-accounts/pool.pid` and state in `pool.json`, then waits on a local `/__pool/health` probe before reporting success. `pool stop` SIGTERMs it and restores `settings.json`.
+- **Account selection** lives in the in-memory `_Pool` object: an ordered account list (active first), a per-account cooldown map (set from a 429's `Retry-After` / `anthropic-ratelimit-*-reset`), and round-robin state for `balance` mode. All mutated under a lock since each request runs in its own thread.
+- **Token freshness** reuses the existing `refresh_access_token` flow: before forwarding, an expiring token is refreshed and persisted back to the Keychain backup; a `401/403` triggers one forced refresh-and-retry on the same account before failing over.
+- **Streaming** is relayed chunk-by-chunk with `flush()` and `Connection: close`, so Server-Sent Events reach the client as they arrive. Hop-by-hop headers are stripped both directions (RFC 7230 §6.1).
+- **Blast radius is zero by design.** Everything binds `127.0.0.1` only, no secret is ever written outside the Keychain, and because `pool stop` restores the prior `ANTHROPIC_BASE_URL`, a failure to route just means Claude Code talks to the API directly as before.
+
+## 10. The `security` CLI surface used
 
 | Operation | Command |
 |-----------|---------|
@@ -281,8 +308,10 @@ gap. It's throttled like the Stop check, so it usually costs one quick usage cal
 
 The macOS account name on the live item is detected dynamically (falling back to `getpass.getuser()`), so nothing about the local user is hardcoded.
 
-## 10. Known trade-offs
+## 11. Known trade-offs
 
 - **macOS only.** Linux Claude Code stores credentials in `~/.claude/.credentials.json` (plaintext). A Linux backend would swap the `kc_*` functions for file operations; the rest of the architecture (index, identity swap, auto-sync) carries over unchanged.
 - **`-w "<secret>"` exposure.** The secret is passed as a process argument, so it's briefly visible to `ps` for the same user during a write. Local-only and transient; eliminating it would require a Keychain API binding rather than the `security` CLI.
-- **New-session scope.** Switching changes the on-disk credential; processes already running keep their in-memory token until restarted.
+- **New-session scope (for `switch`/`autoswitch`).** Changing the on-disk credential doesn't reach a process that's already running. `pool` is the answer when in-session switching is needed — it routes per request instead of swapping the credential.
+- **`pool` depends on `ANTHROPIC_BASE_URL` routing.** Pooling only works if Claude Code honors the base-URL override for the active auth mode. If it doesn't, the proxy receives no traffic; this is detectable (`pool status`, `doctor`) and non-destructive (`pool stop` restores settings).
+- **`pool --mode balance` and subscription terms.** Serving one workflow from several subscription accounts may conflict with Anthropic's terms around rate limits; `failover` mode (one account at a time) mirrors manual switching and is the conservative default.

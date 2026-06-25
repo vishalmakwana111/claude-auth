@@ -136,6 +136,7 @@ claude-auth switch personal
 | `claude-auth switch [name]` | Switch to a saved account. Interactive picker if no name. `--force`, `--no-save`. |
 | `claude-auth usage [name]` | Show rate-limit usage (session + weekly) across accounts. Detail view for one account. |
 | `claude-auth autoswitch on/off/status` | Auto-switch to another account when usage gets high. `--threshold`, `--window`, `--strategy`. |
+| `claude-auth pool start/stop/status` | Run a local proxy that pools all accounts and auto-fails-over on rate limits — **no restart needed**. `--port`, `--mode`, `--no-wire`. |
 | `claude-auth refresh [name]` | Refresh stored tokens of inactive accounts (keeps usage live & backups fresh). |
 | `claude-auth statusline` | Compact one-line status (active account + weekly %) for Claude Code's status line. |
 | `claude-auth current` / `whoami` | Show the active account. |
@@ -177,6 +178,45 @@ How it works:
 Auto-switch installs **two** hooks: a `Stop` hook (idle checkpoint, detached/zero-latency) and a `SessionStart` hook (synchronous **pre-flight** — it tries to switch *before* a new session loads its credentials, so the next session can land on a fresh account automatically).
 
 Check status any time with `claude-auth autoswitch status`, preview a decision with `claude-auth autoswitch run --force --dry-run`, and turn it off with `claude-auth autoswitch off` (which removes both hooks).
+
+### Pool all accounts into one — no restarts: `pool`
+
+`autoswitch` is great, but it has one rough edge: a switch only takes effect on your **next** Claude Code session. `pool` removes that edge entirely.
+
+`claude-auth pool start` launches a tiny **local proxy** (on `127.0.0.1`, your machine only) and points Claude Code at it. From then on, every request Claude Code makes flows through the proxy, which forwards it to the real API using one of your accounts. The moment an account hits its rate limit, the proxy quietly **switches to another account and retries the same request** — mid-conversation, with no switch command and no restart.
+
+```console
+$ claude-auth pool start
+
+  › Starting pool on 127.0.0.1:8848 · mode failover
+  ✓ Pool is live · Claude Code will use it on next start
+  wired ANTHROPIC_BASE_URL into ~/.claude/settings.json
+  stop anytime with claude-auth pool stop
+
+$ claude-auth pool status
+
+  Pool   ·   shared multi-account proxy
+
+  ● running   pid 40127 · 127.0.0.1:8848 · mode failover
+
+  personal   ready       served 142 · failovers 0
+  work       resting 24s served 38 · failovers 1
+
+  ✓ wired into settings.json
+```
+
+**Why it can switch without a restart** (and why it's not a hack): the Messages API is *stateless* — Claude Code resends the whole conversation on every turn, so there is no server-side session to "move." The proxy is just a load-balancer over independent requests, so any account can serve any turn. That's the one thing a credential-on-disk swap can't do.
+
+Two modes:
+
+- `--mode failover` (default) — keep using your current account until it's actually rate-limited, then fail over. This is the safe, conservative choice: it behaves exactly like `autoswitch`, just instantly and without a restart.
+- `--mode balance` — spread requests across all accounts every turn, keeping them all warm.
+
+Turn it off with `claude-auth pool stop` — it shuts the proxy down and restores your `settings.json` (then restart Claude Code).
+
+> **⚠️ Heads-up on Anthropic's terms.** `failover` mode uses one account at a time — the same as switching manually, just automated. `balance` mode draws on several subscription accounts to serve one workflow, which may run against Anthropic's subscription terms (around getting around rate limits). Use your own accounts, and use `balance` knowing that. When in doubt, stick with `failover`.
+
+> **Note:** `pool` works by setting `ANTHROPIC_BASE_URL` so Claude Code routes through the local proxy. If a future Claude Code version stops honoring that for subscription logins, the pool simply won't receive traffic (and `pool status` / `doctor` will tell you) — it can't break your normal setup, because `pool stop` always restores `settings.json`.
 
 ### Keep every account's usage live: `refresh`
 
@@ -292,7 +332,7 @@ A full deep-dive — storage layout, the in-place-update trick, atomic writes, a
 ## Limitations
 
 - **macOS only** for now. Linux stores credentials in `~/.claude/.credentials.json` (plaintext) instead of the Keychain; a Linux backend is a natural future addition.
-- Switching affects **new** sessions only.
+- `switch` / `autoswitch` affect **new** sessions only (a running session caches its token in memory). If you want switching to take effect *inside* a running session, use `claude-auth pool` instead — it routes per-request, so there's nothing to restart.
 
 ## 🐈 One more thing
 
