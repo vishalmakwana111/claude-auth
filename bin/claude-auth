@@ -17,14 +17,18 @@ import json
 import time
 import shutil
 import getpass
+import signal
+import threading
 import subprocess
 import argparse
 import urllib.request
 import urllib.error
+import http.client
 import concurrent.futures
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 API_USAGE = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_BETA = "oauth-2025-04-20"
@@ -49,6 +53,18 @@ AUTOSWITCH_DEFAULTS = {
 
 LIVE_SERVICE = "Claude Code-credentials"   # the item Claude Code itself reads
 STORE_SERVICE = "claude-auth-store"         # our namespaced backups, per account
+
+# pool proxy (see the "pool" section near the bottom)
+DEFAULT_POOL_PORT = 8848
+POOL_PID   = os.path.join(STORE_DIR, "pool.pid")
+POOL_STATE = os.path.join(STORE_DIR, "pool.json")
+POOL_LOG   = os.path.join(STORE_DIR, "pool.log")
+# headers that must NOT be copied through a proxy (RFC 7230 §6.1)
+_HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "trailers", "transfer-encoding", "upgrade",
+}
+POOL = None  # the live _Pool instance, set inside the `pool serve` daemon
 
 REPO = "github.com/vishalmakwana111/claude-auth"
 
@@ -347,6 +363,7 @@ def render_help():
         ("switch",  "[name]",       "Switch to a saved account"),
         ("usage",   "[name]",       "Show rate-limit usage across accounts"),
         ("autoswitch", "[on|off]",  "Auto-switch accounts when usage gets high"),
+        ("pool",    "[start|stop]",  "Pool all accounts behind one auto-failover proxy"),
         ("refresh", "[name]",       "Refresh stored tokens of inactive accounts"),
         ("statusline", "",          "Compact status line for Claude Code"),
         ("list",    "",             "List saved accounts" + dim("  (alias: ls)")),
@@ -1278,6 +1295,553 @@ def cmd_autoswitch(args):
     else:  # status
         _autoswitch_status(idx, cfg)
 
+# ──────────────────────────────── pool ────────────────────────────────────
+#
+# `pool` runs a tiny local proxy that all your accounts share. Claude Code is
+# pointed at  http://127.0.0.1:<port>  (via ANTHROPIC_BASE_URL in settings.json),
+# and every request is forwarded to the real API using one account's token.
+# When an account hits its rate limit (HTTP 429) the proxy quietly fails over to
+# another account and retries the *same* request — so a running session keeps
+# going without a switch or a restart.
+#
+# Why this is correct and not a hack: the Messages API is stateless. The client
+# resends the whole conversation on every turn, so there is no server-side
+# session to "move" — any account can serve any turn. The proxy is just a
+# load-balancer over stateless requests.
+#
+# Testing seam: set CLAUDE_AUTH_UPSTREAM_HOST / _PORT / _PLAIN to point the
+# forwarder at a fake upstream instead of api.anthropic.com.
+
+def _upstream_host():
+    return os.environ.get("CLAUDE_AUTH_UPSTREAM_HOST", "api.anthropic.com")
+
+def _upstream_conn():
+    host = _upstream_host()
+    if os.environ.get("CLAUDE_AUTH_UPSTREAM_PLAIN"):   # plain HTTP, for tests only
+        return http.client.HTTPConnection(
+            host, int(os.environ.get("CLAUDE_AUTH_UPSTREAM_PORT", "80")), timeout=300)
+    return http.client.HTTPSConnection(
+        host, int(os.environ.get("CLAUDE_AUTH_UPSTREAM_PORT", "443")), timeout=300)
+
+def _retry_after_secs(headers):
+    """How long to rest an account after a 429, from the response headers."""
+    ra = headers.get("Retry-After")
+    if ra:
+        try:
+            return max(5, int(float(ra)))
+        except ValueError:
+            pass
+    for k in ("anthropic-ratelimit-unified-reset",
+              "anthropic-ratelimit-unified-5h-reset"):
+        v = headers.get(k)
+        if v:
+            try:
+                return max(5, int(float(v) - time.time()))
+            except ValueError:
+                pass
+    return 60
+
+def _pool_log(msg):
+    try:
+        os.makedirs(STORE_DIR, exist_ok=True)
+        ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        with open(POOL_LOG, "a") as f:
+            f.write(f"{ts}  {msg}\n")
+    except Exception:
+        pass
+
+def _pool_persist_token(name, token, refresh, expires_in):
+    """Best-effort: write a freshly minted token back to the Keychain backup so
+    other commands (and a later pool restart) see it too. Never fatal."""
+    try:
+        raw = kc_read(STORE_SERVICE, name)
+        if not raw:
+            return
+        blob = json.loads(raw)
+        cred = blob.setdefault("claudeAiOauth", {})
+        cred["accessToken"] = token
+        if refresh:
+            cred["refreshToken"] = refresh
+        if expires_in:
+            cred["expiresAt"] = int((time.time() + expires_in) * 1000)
+        # write the keychain item directly (avoid kc_write's die-on-error)
+        subprocess.run(
+            ["security", "add-generic-password", "-U", "-s", STORE_SERVICE,
+             "-a", name, "-w", json.dumps(blob), "-l", f"claude-auth: {name}"],
+            capture_output=True, text=True)
+    except Exception:
+        pass
+
+
+class _Pool:
+    """Holds every account's token and decides which one serves each request."""
+
+    def __init__(self, mode):
+        self.mode = mode if mode in ("failover", "balance") else "failover"
+        self.lock = threading.Lock()
+        self.cooldown = {}     # name -> epoch the account is usable again (after a 429)
+        self.stats = {}        # name -> {"served", "failover", "last"}
+        self.rr = -1           # round-robin cursor (balance mode)
+        self.accounts = []     # [{name, token, refresh, expiresAt}], active first
+        self.reload()
+
+    def reload(self):
+        idx = load_index()
+        active = active_name(idx)
+        names = sorted(idx["accounts"])
+        if active in names:                      # serve from the active account first
+            names.remove(active)
+            names.insert(0, active)
+        accts = []
+        for name in names:
+            raw = kc_read(STORE_SERVICE, name)
+            if not raw:
+                continue
+            try:
+                cred = json.loads(raw).get("claudeAiOauth", {})
+            except Exception:
+                continue
+            if not cred.get("accessToken"):
+                continue
+            accts.append({
+                "name": name,
+                "token": cred["accessToken"],
+                "refresh": cred.get("refreshToken"),
+                "expiresAt": cred.get("expiresAt"),
+            })
+        with self.lock:
+            self.accounts = accts
+            self.stats = {a["name"]: self.stats.get(
+                a["name"], {"served": 0, "failover": 0, "last": 0}) for a in accts}
+
+    def _by_name(self, name):
+        for a in self.accounts:
+            if a["name"] == name:
+                return a
+        return None
+
+    def pick(self, exclude=()):
+        """Name of the next account to try, or None if all are on cooldown."""
+        now = time.time()
+        with self.lock:
+            avail = [a for a in self.accounts
+                     if a["name"] not in exclude
+                     and self.cooldown.get(a["name"], 0) <= now]
+            if not avail:
+                return None
+            if self.mode == "balance":
+                self.rr = (self.rr + 1) % len(avail)
+                return avail[self.rr]["name"]
+            return avail[0]["name"]            # failover: highest-priority healthy one
+
+    def mark_exhausted(self, name, secs):
+        with self.lock:
+            self.cooldown[name] = time.time() + max(5, secs)
+            self.stats.setdefault(name, {"served": 0, "failover": 0, "last": 0})["failover"] += 1
+        _pool_log(f"{name}: rate-limited, resting {secs}s")
+
+    def note_served(self, name):
+        with self.lock:
+            s = self.stats.setdefault(name, {"served": 0, "failover": 0, "last": 0})
+            s["served"] += 1
+            s["last"] = int(time.time())
+
+    def force_refresh(self, name):
+        with self.lock:
+            a = self._by_name(name)
+            if a:
+                a["expiresAt"] = 0            # force token_for() to mint a new one
+
+    def token_for(self, name):
+        """A usable access token for `name`, refreshing it first if it's expiring."""
+        with self.lock:
+            a = self._by_name(name)
+            if not a:
+                return None
+            exp, tok, rt = a.get("expiresAt") or 0, a["token"], a.get("refresh")
+        if exp and exp / 1000 > time.time() + 60:
+            return tok
+        if not rt:
+            return tok
+        data, _err = refresh_access_token(rt)
+        if not data or not data.get("access_token"):
+            return tok                        # keep old token; a 401 will retrigger refresh
+        new = data["access_token"]
+        with self.lock:
+            a = self._by_name(name)
+            if a:
+                a["token"] = new
+                if data.get("refresh_token"):
+                    a["refresh"] = data["refresh_token"]
+                if data.get("expires_in"):
+                    a["expiresAt"] = int((time.time() + data["expires_in"]) * 1000)
+        _pool_persist_token(name, new, data.get("refresh_token"), data.get("expires_in"))
+        return new
+
+    def snapshot(self):
+        now = time.time()
+        with self.lock:
+            return {
+                "mode": self.mode,
+                "accounts": [{
+                    "name": a["name"],
+                    "cooldown": max(0, int(self.cooldown.get(a["name"], 0) - now)),
+                    "served": self.stats.get(a["name"], {}).get("served", 0),
+                    "failover": self.stats.get(a["name"], {}).get("failover", 0),
+                } for a in self.accounts],
+            }
+
+
+class PoolHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = f"claude-auth-pool/{__version__}"
+
+    def log_message(self, fmt, *a):          # quiet stderr; everything goes to the log file
+        _pool_log(fmt % a)
+
+    def do_GET(self):
+        if self.path.startswith("/__pool/"):
+            return self._control()
+        self._proxy()
+
+    def do_POST(self):   self._proxy()
+    def do_PUT(self):    self._proxy()
+    def do_PATCH(self):  self._proxy()
+    def do_DELETE(self): self._proxy()
+
+    # ---- local control endpoint (never forwarded) ----
+    def _control(self):
+        self._send_json(200, POOL.snapshot() if POOL else {})
+
+    # ---- the proxy itself ----
+    def _proxy(self):
+        if POOL is None or not POOL.accounts:
+            return self._send_json(503, _err_body("no accounts available to pool"))
+        body = self._read_body()
+        tried, last = set(), None
+        for _ in range(len(POOL.accounts)):
+            name = POOL.pick(exclude=tried)
+            if not name:
+                break
+            tried.add(name)
+            token = POOL.token_for(name)
+            if not token:
+                continue
+            resp, conn, err = self._send(token, body)
+            if err:
+                last = ("err", err)
+                continue
+            if resp.status in (401, 403):    # bad/expired token → refresh once, retry same acct
+                self._drain(resp, conn)
+                POOL.force_refresh(name)
+                resp, conn, err = self._send(POOL.token_for(name), body)
+                if err:
+                    last = ("err", err)
+                    continue
+            if resp.status == 429:           # rate-limited → rest this account, fail over
+                POOL.mark_exhausted(name, _retry_after_secs(resp.headers))
+                self._drain(resp, conn)
+                last = ("429", name)
+                continue
+            POOL.note_served(name)           # success (or a real API error) → stream it back
+            self._stream(resp, name)
+            self._close(conn)
+            return
+        self._all_busy(last)
+
+    def _send(self, token, body):
+        try:
+            conn = _upstream_conn()
+            conn.request(self.command, self.path, body=body,
+                         headers=self._upstream_headers(token))
+            return conn.getresponse(), conn, None
+        except Exception as e:
+            return None, None, str(e)
+
+    def _upstream_headers(self, token):
+        h = {}
+        for k in self.headers.keys():        # pass Claude Code's own headers through…
+            lk = k.lower()
+            if lk in _HOP_BY_HOP or lk in ("host", "authorization", "content-length"):
+                continue
+            h[k] = self.headers[k]
+        h["Host"] = _upstream_host()         # …but swap in our host + chosen account's token
+        h["Authorization"] = f"Bearer {token}"
+        return h
+
+    def _stream(self, resp, name):
+        """Relay the upstream response, byte for byte, flushing as it arrives (SSE-safe)."""
+        self.send_response(resp.status)
+        for k, v in resp.getheaders():
+            if k.lower() in _HOP_BY_HOP or k.lower() in ("content-length", "connection"):
+                continue
+            self.send_header(k, v)
+        self.send_header("X-Claude-Auth-Account", name)   # which account served this
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except Exception:
+            pass
+
+    # ---- small helpers ----
+    def _read_body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(n) if n > 0 else b""
+
+    def _drain(self, resp, conn):
+        try:
+            resp.read()
+        except Exception:
+            pass
+        self._close(conn)
+
+    def _close(self, conn):
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def _send_json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def _all_busy(self, last):
+        if last and last[0] == "429":
+            self._send_json(429, _err_body(
+                "all pooled accounts are at their rate limit — try again soon"))
+        else:
+            detail = last[1] if last else "unknown error"
+            self._send_json(502, _err_body(f"pool could not reach the API ({detail})"))
+
+
+def _err_body(message):
+    return {"type": "error",
+            "error": {"type": "claude_auth_pool_error", "message": message}}
+
+
+# ─────────────────────── pool: daemon + control commands ───────────────────
+
+def _pool_pid():
+    """Return the live daemon's pid, or None (cleaning up a stale pid file)."""
+    try:
+        with open(POOL_PID) as f:
+            pid = int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        try:
+            os.remove(POOL_PID)
+        except OSError:
+            pass
+        return None
+    return pid
+
+def _pool_read_state():
+    try:
+        with open(POOL_STATE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def _pool_write_state(d):
+    os.makedirs(STORE_DIR, exist_ok=True)
+    tmp = POOL_STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=2)
+    os.replace(tmp, POOL_STATE)
+
+def _wire_base_url(port):
+    """Point Claude Code at the pool by setting env.ANTHROPIC_BASE_URL in settings."""
+    s = _read_settings()
+    env = s.setdefault("env", {})
+    url = f"http://127.0.0.1:{port}"
+    prev = env.get("ANTHROPIC_BASE_URL")
+    if prev and prev != url and not prev.startswith("http://127.0.0.1:"):
+        st = _pool_read_state()
+        st["prevBaseUrl"] = prev               # remember it so `stop` can restore it
+        _pool_write_state(st)
+        warn(f"replacing existing ANTHROPIC_BASE_URL ({prev}) — restored on `pool stop`")
+    env["ANTHROPIC_BASE_URL"] = url
+    _write_settings(s)
+
+def _unwire_base_url():
+    s = _read_settings()
+    env = s.get("env")
+    if not isinstance(env, dict):
+        return
+    cur = env.get("ANTHROPIC_BASE_URL", "")
+    if not cur.startswith("http://127.0.0.1:"):
+        return                                 # not ours — leave the user's value alone
+    prev = _pool_read_state().get("prevBaseUrl")
+    if prev:
+        env["ANTHROPIC_BASE_URL"] = prev
+    else:
+        del env["ANTHROPIC_BASE_URL"]
+        if not env:
+            s.pop("env", None)
+    _write_settings(s)
+
+def _pool_wait_health(port, timeout=6.0):
+    deadline = time.time() + timeout
+    url = f"http://127.0.0.1:{port}/__pool/health"
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=1) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            time.sleep(0.15)
+    return False
+
+def _pool_serve(args):
+    """The daemon: bind the proxy and serve until SIGTERM. Spawned by `pool start`."""
+    global POOL
+    POOL = _Pool(args.mode or "failover")
+    if not POOL.accounts:
+        _pool_log("no accounts to serve; exiting")
+        die("no accounts available to pool")
+    port = args.port or DEFAULT_POOL_PORT
+    try:
+        httpd = ThreadingHTTPServer(("127.0.0.1", port), PoolHandler)
+    except OSError as e:
+        die(f"could not bind 127.0.0.1:{port} — {e}")
+    httpd.daemon_threads = True
+    try:
+        with open(POOL_PID, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+
+    def _bye(*_):
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+    signal.signal(signal.SIGTERM, _bye)
+    signal.signal(signal.SIGINT, _bye)
+
+    _pool_log(f"serving 127.0.0.1:{port} mode={POOL.mode} "
+              f"accounts={[a['name'] for a in POOL.accounts]}")
+    httpd.serve_forever()
+    _pool_log("stopped")
+
+def _pool_start(args):
+    idx = load_index()
+    n = len(idx["accounts"])
+    if n == 0:
+        die("no saved accounts — run " + clay("claude-auth login") + " or " + clay("add") + " first")
+    pid = _pool_pid()
+    if pid:
+        die(f"pool already running (pid {pid}) — run " + clay("claude-auth pool stop") + " first")
+    port = args.port or DEFAULT_POOL_PORT
+    mode = args.mode or "failover"
+    info()
+    if n == 1:
+        warn("only 1 account saved — the pool needs 2+ to fail over")
+    step(f"Starting pool on {clay(f'127.0.0.1:{port}')} {dim('· mode ' + mode)}")
+    logf = open(POOL_LOG, "a")
+    subprocess.Popen([_bin_path(), "pool", "serve", "--port", str(port), "--mode", mode],
+                     stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+    if not _pool_wait_health(port):
+        die("pool did not come up — check " + POOL_LOG)
+    _pool_write_state({"port": port, "mode": mode, "startedAt": int(time.time())})
+    if not args.no_wire:
+        _wire_base_url(port)
+        ok("Pool is live " + dim("· Claude Code will use it on next start"))
+        hint("wired " + ink("ANTHROPIC_BASE_URL") + " into ~/.claude/settings.json")
+    else:
+        ok(f"Pool is live on {clay(f'http://127.0.0.1:{port}')}")
+        hint("point Claude Code at it:  " +
+             clay(f"export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}"))
+    hint("stop anytime with " + clay("claude-auth pool stop"))
+    info()
+
+def _pool_stop(args):
+    pid = _pool_pid()
+    _unwire_base_url()
+    info()
+    if not pid:
+        hint("pool not running " + dim("(settings.json restored)"))
+        info()
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    for _ in range(20):                        # wait up to ~2s for a clean exit
+        if not _pool_pid():
+            break
+        time.sleep(0.1)
+    try:
+        os.remove(POOL_PID)
+    except OSError:
+        pass
+    ok("Pool stopped " + dim("(settings.json restored)"))
+    hint("↻ restart Claude Code to stop using the pool")
+    info()
+
+def _pool_status(args):
+    pid = _pool_pid()
+    st = _pool_read_state()
+    info()
+    info(IND + bold(clay("Pool")) + dim("   ·   shared multi-account proxy"))
+    info()
+    if not pid:
+        info(IND + dim("○") + " " + dim("not running"))
+        hint("start with " + clay("claude-auth pool start"))
+        info()
+        return
+    port = st.get("port", DEFAULT_POOL_PORT)
+    info(IND + green("●") + " running   " +
+         dim(f"pid {pid} · 127.0.0.1:{port} · mode {st.get('mode', '?')}"))
+    snap = None
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/__pool/health", timeout=2) as r:
+            snap = json.loads(r.read().decode())
+    except Exception:
+        pass
+    if snap and snap.get("accounts"):
+        info()
+        w = max(len(a["name"]) for a in snap["accounts"])
+        for a in snap["accounts"]:
+            cd = a["cooldown"]
+            state = green("ready") if cd == 0 else yellow(f"resting {cd}s")
+            info(IND * 2 + ink(vpad(a["name"], w)) + "  " + state +
+                 dim(f"   served {a['served']} · failovers {a['failover']}"))
+    wired = (_read_settings().get("env") or {}).get("ANTHROPIC_BASE_URL", "")
+    info()
+    if wired.startswith("http://127.0.0.1:"):
+        info(IND * 2 + green("✓") + dim(" wired into settings.json"))
+    else:
+        info(IND * 2 + yellow("!") + dim(" not wired — Claude Code won't use it (pool start --no-wire?)"))
+    info()
+
+def cmd_pool(args):
+    action = args.action or "status"
+    if action == "serve":
+        _pool_serve(args)
+    elif action == "start":
+        _pool_start(args)
+    elif action == "stop":
+        _pool_stop(args)
+    else:
+        _pool_status(args)
+
 # ─────────────────────────────── doctor ───────────────────────────────────
 
 def cmd_doctor(args):
@@ -1343,6 +1907,18 @@ def cmd_doctor(args):
     if "claude-auth statusline" in slcmd:
         check("ok", "statusline", "wired into settings.json")
 
+    # pool proxy (informational — only shown when running or wired)
+    ppid = _pool_pid()
+    pwired = (_read_settings().get("env") or {}).get("ANTHROPIC_BASE_URL", "")
+    pmine = pwired.startswith("http://127.0.0.1:")
+    if ppid and pmine:
+        check("ok", "pool", f"running (pid {ppid}) and wired into settings.json")
+    elif ppid and not pmine:
+        check("warn", "pool", "running but not wired — `claude-auth pool start` to wire it")
+    elif pmine and not ppid:
+        check("warn", "pool",
+              "settings.json points at a pool that isn't running — `claude-auth pool stop`")
+
     # per-account token freshness (offline — reads keychain, no network)
     if idx["accounts"]:
         info()
@@ -1378,7 +1954,7 @@ _BASH_COMPLETION = r'''
 _claude_auth() {
   local cur prev cmds sub
   cur="${COMP_WORDS[COMP_CWORD]}"
-  cmds="login add list ls switch usage autoswitch refresh statusline current whoami rename remove rm doctor completion help"
+  cmds="login add list ls switch usage autoswitch pool refresh statusline current whoami rename remove rm doctor completion help"
   if [ "$COMP_CWORD" -eq 1 ]; then
     COMPREPLY=( $(compgen -W "$cmds" -- "$cur") ); return
   fi
@@ -1387,6 +1963,7 @@ _claude_auth() {
     switch|usage|rename|remove|rm|refresh)
       COMPREPLY=( $(compgen -W "$(claude-auth completion --names 2>/dev/null)" -- "$cur") ) ;;
     autoswitch) COMPREPLY=( $(compgen -W "on off status run" -- "$cur") ) ;;
+    pool) COMPREPLY=( $(compgen -W "start stop status" -- "$cur") ) ;;
     completion) COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") ) ;;
   esac
 }
@@ -1396,12 +1973,13 @@ complete -F _claude_auth claude-auth
 _ZSH_COMPLETION = r'''
 _claude_auth() {
   local -a cmds
-  cmds=(login add list ls switch usage autoswitch refresh statusline current whoami rename remove rm doctor completion)
+  cmds=(login add list ls switch usage autoswitch pool refresh statusline current whoami rename remove rm doctor completion)
   if (( CURRENT == 2 )); then compadd -- $cmds; return; fi
   case "${words[2]}" in
     switch|usage|rename|remove|rm|refresh)
       compadd -- ${(f)"$(claude-auth completion --names 2>/dev/null)"} ;;
     autoswitch) compadd -- on off status run ;;
+    pool) compadd -- start stop status ;;
     completion) compadd -- bash zsh ;;
   esac
 }
@@ -1422,6 +2000,7 @@ _COMMAND_REFERENCE = [
         ("usage",      "[name]",   "Show rate-limit usage across accounts", "--quiet"),
         ("refresh",    "[name]",   "Refresh stored tokens of inactive accounts", ""),
         ("autoswitch", "[on|off]", "Auto-switch when usage gets high", "status|run · --threshold --window --strategy"),
+        ("pool",       "[start|stop]", "Pool all accounts behind one auto-failover proxy", "status · --port --mode --no-wire"),
     ]),
     ("SETUP & INTEGRATION", [
         ("statusline", "",         "Compact status line for Claude Code", "--plain"),
@@ -1546,6 +2125,17 @@ def build_parser():
     asw.add_argument("--force", action="store_true", help="ignore enabled/throttle and run now")
     asw.add_argument("--dry-run", action="store_true", help="decide and report, but don't switch")
     asw.set_defaults(func=cmd_autoswitch)
+
+    pl = sub.add_parser("pool", help="pool all accounts behind one auto-failover proxy")
+    pl.add_argument("action", nargs="?", default="status",
+                    choices=["start", "stop", "status", "serve"])
+    pl.add_argument("--port", type=int,
+                    help=f"port to listen on (default {DEFAULT_POOL_PORT})")
+    pl.add_argument("--mode", choices=["failover", "balance"],
+                    help="failover = move only when rate-limited; balance = spread every request")
+    pl.add_argument("--no-wire", action="store_true",
+                    help="don't edit settings.json; just print the URL to set yourself")
+    pl.set_defaults(func=cmd_pool)
 
     rn = sub.add_parser("rename", help="rename a saved account")
     rn.add_argument("old")
