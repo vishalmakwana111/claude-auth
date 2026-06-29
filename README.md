@@ -45,19 +45,21 @@ $ claude-auth usage
 
   Usage   ·   weekly limit is the one that bites
 
-  ┌───┬──────────┬──────────────────────────┬─────────────────────────────────┬─────────┐
-  │   │ ACCOUNT  │ SESSION                  │ WEEK                            │ UPDATED │
-  ├───┼──────────┼──────────────────────────┼─────────────────────────────────┼─────────┤
-  │ ○ │ personal │ ██░░░░░░░░  23%  10:19pm │ ██░░░░░░░░  24%  Jun 26 12:29am │ live    │
-  │ ● │ work     │ █░░░░░░░░░  12%  8:39pm  │ ██████░░░░  57%  Jun 25 3:29am  │ live    │
-  └───┴──────────┴──────────────────────────┴─────────────────────────────────┴─────────┘
+  ┌───┬──────────┬────────┬──────────────────────────┬─────────────────────────────────┬─────────┐
+  │   │ ACCOUNT  │ TIER   │ SESSION                  │ WEEK                            │ UPDATED │
+  ├───┼──────────┼────────┼──────────────────────────┼─────────────────────────────────┼─────────┤
+  │ ○ │ personal │ Max 5x │ ██░░░░░░░░  23%  10:19pm │ ██░░░░░░░░  24%  Jun 26 12:29am │ live    │
+  │ ● │ work     │ Team   │ █░░░░░░░░░  12%  8:39pm  │ ██████░░░░  57%  Jun 25 3:29am  │ live    │
+  └───┴──────────┴────────┴──────────────────────────┴─────────────────────────────────┴─────────┘
 
   █ <50%   █ <80%   █ ≥80%
 ```
 
+The **`TIER`** column tells you each account's plan at a glance — `Pro`, `Max 5x`, `Max 20x`, `Team`, `Enterprise`, or `Free` — so you can see *which* account carries the bigger rate limit, not just how much of it is left. The single-account detail view (`claude-auth usage <name>`) shows the same tier next to the email in its header.
+
 `claude-auth usage <name>` gives a detailed breakdown (5-hour session, weekly all-models, weekly Sonnet/Opus) with reset countdowns.
 
-It works across **all** accounts at once — without switching — because each account's token is already saved, and usage is fetched from Anthropic's `/api/oauth/usage` endpoint (the same data Claude Code's `/status` → Usage tab shows). Bars are colored by severity (green < 50%, amber < 80%, red ≥ 80%). If an inactive account's short-lived token has expired, the last fetched snapshot is shown with its age; switching to that account refreshes it.
+It works across **all** accounts at once — without switching — because each account's token is already saved, and usage is fetched from Anthropic's `/api/oauth/usage` endpoint (the same data Claude Code's `/status` → Usage tab shows). Bars are colored by severity (green < 50%, amber < 80%, red ≥ 80%). The tier comes straight from the saved account metadata (no extra request). If an inactive account's short-lived token has expired, the last fetched snapshot is shown with its age; switching to that account refreshes it.
 
 ---
 
@@ -134,7 +136,7 @@ claude-auth switch personal
 | `claude-auth add [name]` | Save the **currently** logged-in account. Name defaults to the email prefix. `--force` to overwrite. |
 | `claude-auth list` / `ls` | List saved accounts. `*` marks the active one. |
 | `claude-auth switch [name]` | Switch to a saved account. Interactive picker if no name. `--force`, `--no-save`. |
-| `claude-auth usage [name]` | Show rate-limit usage (session + weekly) across accounts. Detail view for one account. |
+| `claude-auth usage [name]` | Show plan tier + rate-limit usage (session + weekly) across accounts. Detail view for one account. |
 | `claude-auth autoswitch on/off/status` | Auto-switch to another account when usage gets high. `--threshold`, `--window`, `--strategy`. |
 | `claude-auth pool start/stop/status` | Run a local proxy that pools all accounts and auto-fails-over on rate limits — **no restart needed**. `--port`, `--mode`, `--no-wire`. |
 | `claude-auth refresh [name]` | Refresh stored tokens of inactive accounts (keeps usage live & backups fresh). |
