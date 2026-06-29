@@ -110,6 +110,19 @@ chmod +x ~/.local/bin/claude-auth
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
 ```
 
+### Updating
+
+Once installed, update in place — no need to re-clone:
+
+```bash
+claude-auth update          # downloads the latest version and replaces itself
+claude-auth update --check  # just tell me if a newer version exists
+```
+
+`update` fetches the latest `bin/claude-auth` from GitHub, verifies it parses as valid Python, then atomically swaps it over the running file. Your saved accounts are untouched — they live in the Keychain and `~/.claude-accounts/`, separate from the binary. `claude-auth doctor` also reports when a newer version is available.
+
+> If the binary lives somewhere you can't write to, `update` tells you — just re-run `./install.sh` (or use `sudo`).
+
 ## Quick start
 
 ```bash
@@ -144,7 +157,8 @@ claude-auth switch personal
 | `claude-auth current` / `whoami` | Show the active account. |
 | `claude-auth rename <old> <new>` | Rename a saved profile (moves its Keychain backup too). |
 | `claude-auth remove <name>` / `rm` | Delete a saved profile. `--force` to remove the active one. |
-| `claude-auth doctor` | Health-check the setup: `claude`/PATH/Keychain/hooks/token validity. |
+| `claude-auth doctor` | Health-check the setup: `claude`/PATH/Keychain/hooks/token validity/latest version. |
+| `claude-auth update` | Update claude-auth to the latest version from GitHub. `--check` to only check, `--force` to reinstall. |
 | `claude-auth completion bash\|zsh` | Output a shell-completion script (tab-complete commands & account names). |
 | `claude-auth commands` | Show a grouped cheat sheet of every command, with flags and aliases. |
 
