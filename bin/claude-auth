@@ -174,6 +174,54 @@ def parse_usage(d):
         "week_opus": win("seven_day_opus"),
     }
 
+# Friendly plan/seat labels derived from the OAuth account metadata.
+# `userRateLimitTier` is the field that actually separates a Pro seat from a
+# Max 5x / Max 20x seat — even inside a Team org — so it's checked first.
+# Team/Enterprise seats report a generic rate-limit tier (e.g. `default_raven`),
+# so we fall back to `seatTier` for those.
+_RATE_LIMIT_TIER_LABELS = {
+    "default_claude_free": "Free",
+    "default_claude_pro": "Pro",
+    "default_claude_max_5x": "Max 5x",
+    "default_claude_max_20x": "Max 20x",
+}
+_SEAT_TIER_LABELS = {
+    "team_standard": "Team",
+    "team_tier_1": "Team",
+}
+
+def plan_label(oauth, subscription_type=None):
+    """Human-friendly plan/seat tier (Pro, Max 5x, Team, …) from oauth metadata.
+
+    Returns "—" when nothing identifiable is stored (e.g. an account saved by an
+    older version that didn't capture `oauthAccount`)."""
+    oauth = oauth or {}
+    rlt = (oauth.get("userRateLimitTier") or "").strip()
+    if rlt in _RATE_LIMIT_TIER_LABELS:
+        return _RATE_LIMIT_TIER_LABELS[rlt]
+    # Substring fallbacks so new tier ids (e.g. a future max_50x) still resolve.
+    low = rlt.lower()
+    if "max_20x" in low: return "Max 20x"
+    if "max_5x" in low:  return "Max 5x"
+    if "max" in low:     return "Max"
+    if "pro" in low:     return "Pro"
+    if "free" in low:    return "Free"
+    # Generic team/enterprise rate-limit tier — use the seat tier instead.
+    seat = (oauth.get("seatTier") or "").strip()
+    if seat in _SEAT_TIER_LABELS:
+        return _SEAT_TIER_LABELS[seat]
+    if seat.startswith("team"):       return "Team"
+    if "enterprise" in seat.lower():  return "Enterprise"
+    # Last resort: the legacy subscriptionType, prettified.
+    sub = (subscription_type or oauth.get("subscriptionType") or "").strip()
+    if sub:
+        return sub.replace("_", " ").title()
+    return "—"
+
+def account_tier(p):
+    """Plan label for a saved-profile dict from the accounts index."""
+    return plan_label(p.get("oauthAccount"), p.get("subscriptionType"))
+
 def refresh_access_token(refresh_token, timeout=10):
     """Exchange a refresh token for a fresh credential. Returns (data, err)."""
     body = json.dumps({
@@ -810,14 +858,16 @@ def _usage_table(names, idx, results, active):
         rows.append({
             "name": name, "active": name == active, "fresh": fresh,
             "has": bool(u),
+            "tier": account_tier(idx["accounts"][name]),
             "sess": _win_cell(u.get("session") if u else None, BARW),
             "week": _win_cell(u.get("week") if u else None, BARW),
         })
     w_name = max(len("ACCOUNT"), max(len(r["name"]) for r in rows))
+    w_tier = max(len("TIER"),    max(len(r["tier"]) for r in rows))
     w_sess = max(len("SESSION"), max(vlen(r["sess"]) for r in rows))
     w_week = max(len("WEEK"),    max(vlen(r["week"]) for r in rows))
     w_fresh = max(len("UPDATED"), max(len(r["fresh"]) for r in rows))
-    widths = [1, w_name, w_sess, w_week, w_fresh]
+    widths = [1, w_name, w_tier, w_sess, w_week, w_fresh]
 
     def border(l, m, rt):
         return dim(l + m.join("─" * (w + 2) for w in widths) + rt)
@@ -832,6 +882,7 @@ def _usage_table(names, idx, results, active):
     info(IND + border("┌", "┬", "┐"))
     info(line([_cell("", 1, dim),
                _cell("ACCOUNT", w_name, H),
+               _cell("TIER", w_tier, H),
                _cell("SESSION", w_sess, H),
                _cell("WEEK", w_week, H),
                _cell("UPDATED", w_fresh, H)]))
@@ -840,9 +891,11 @@ def _usage_table(names, idx, results, active):
         a = r["active"]
         dot = green("●") if a else dim("○")
         name_c = (lambda s: bold(clay(s))) if a else ink
+        tier_c = ink if a else dim
         fresh_c = green if r["fresh"] == "live" else (dim if r["has"] else yellow)
         info(line([" " + dot + " ",
                    _cell(r["name"], w_name, name_c),
+                   _cell(r["tier"], w_tier, tier_c),
                    " " + vpad(r["sess"], w_sess) + " ",
                    " " + vpad(r["week"], w_week) + " ",
                    _cell(r["fresh"], w_fresh, fresh_c)]))
@@ -857,7 +910,11 @@ def _usage_detail(name, idx, res, active):
     p = idx["accounts"][name]
     dot = green("●") if name == active else dim("○")
     info()
-    info(IND + dot + " " + bold(clay(name)) + dim("  · " + (p.get("email") or "")))
+    header = IND + dot + " " + bold(clay(name)) + dim("  · " + (p.get("email") or ""))
+    tier = account_tier(p)
+    if tier != "—":
+        header += dim("  · ") + ink(tier)
+    info(header)
     info()
     if not u:
         warn(f"usage unavailable ({res['error']})")
